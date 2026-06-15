@@ -2,8 +2,8 @@
 import secrets as _secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import RedirectResponse, Response
 
 from src import consent_text, db
 from src.config import settings
@@ -123,3 +123,61 @@ async def verify_email(token: str, request: Request):
     )
 
     return RedirectResponse(url=f"{portal}?verified=1", status_code=302)
+
+
+@app.post("/api/email/resend")
+async def resend_verification(request: Request, x_auth_request_email: str = Header(default="")):
+    sid = extract_synthetic_id(x_auth_request_email)
+    user = await db.fetch_user(sid)
+
+    if user is None:
+        raise HTTPException(status_code=400, detail="No email submitted yet")
+    if user["verified"]:
+        raise HTTPException(status_code=400, detail="Already verified")
+
+    new_token = _secrets.token_urlsafe(32)
+    new_expires = datetime.now(timezone.utc) + timedelta(
+        hours=settings.verification_link_expiry_hours
+    )
+    ok = await db.rotate_verification_token(sid, new_token, new_expires)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Token rotation failed")
+
+    await db.insert_audit(
+        synthetic_id=sid,
+        action="resend_verification",
+        email=user["real_email"],
+        consent_text_version=None,
+        consent_text_content=None,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+
+    try:
+        from src.email_sender import send_verification_email
+        await send_verification_email(
+            to_email=user["real_email"],
+            display_name=user["display_name"],
+            verification_token=new_token,
+        )
+    except Exception as exc:
+        print(f"WARN: resend email send failed: {exc}")
+
+    return {"status": "ok"}
+
+
+@app.post("/api/dismiss", status_code=204)
+async def dismiss(request: Request, x_auth_request_email: str = Header(default="")):
+    sid = extract_synthetic_id(x_auth_request_email)
+
+    await db.insert_audit(
+        synthetic_id=sid,
+        action="dismiss_modal",
+        email=None,
+        consent_text_version=None,
+        consent_text_content=None,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
