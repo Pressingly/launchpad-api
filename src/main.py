@@ -1,8 +1,12 @@
 """launchpad-api — FastAPI service for email collection and verification."""
-from fastapi import FastAPI, Header, HTTPException
+import secrets as _secrets
+from datetime import datetime, timedelta, timezone
 
-from src import db
-from src.models import UserStateResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+
+from src import consent_text, db
+from src.config import settings
+from src.models import EmailSubmitRequest, UserStateResponse
 
 app = FastAPI(title="launchpad-api", docs_url=None, redoc_url=None)
 
@@ -41,3 +45,45 @@ async def get_me(x_auth_request_email: str = Header(default="")):
         email=user["real_email"],
         verification_expires_at=user["verification_expires"],
     )
+
+
+@app.post("/api/email", status_code=202)
+async def submit_email(
+    payload: EmailSubmitRequest,
+    request: Request,
+    x_auth_request_email: str = Header(default=""),
+):
+    sid = extract_synthetic_id(x_auth_request_email)
+
+    if not consent_text.is_valid_version(payload.consent_text_version):
+        raise HTTPException(status_code=400, detail="Unknown consent_text_version")
+
+    token = _secrets.token_urlsafe(32)
+    expires = datetime.now(timezone.utc) + timedelta(
+        hours=settings.verification_link_expiry_hours
+    )
+
+    await db.insert_user(
+        synthetic_id=sid,
+        email=str(payload.email),
+        display_name=payload.display_name,
+        verification_token=token,
+        verification_expires=expires,
+    )
+
+    await db.insert_audit(
+        synthetic_id=sid,
+        action="submit_email",
+        email=str(payload.email),
+        consent_text_version=payload.consent_text_version,
+        consent_text_content=consent_text.get_text(payload.consent_text_version),
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+
+    # TODO Task 10: send verification email here
+
+    return {
+        "state": "pending_verification",
+        "verification_expires_at": expires.isoformat(),
+    }
