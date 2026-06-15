@@ -81,7 +81,17 @@ async def submit_email(
         user_agent=request.headers.get("user-agent"),
     )
 
-    # TODO Task 10: send verification email here
+    # Send verification email (failures don't break submission — log and continue)
+    try:
+        from src.email_sender import send_verification_email
+        await send_verification_email(
+            to_email=str(payload.email),
+            display_name=payload.display_name,
+            verification_token=token,
+        )
+    except Exception as exc:
+        # In a real implementation, log this properly. For now print.
+        print(f"WARN: verification email send failed: {exc}")
 
     return {
         "state": "pending_verification",

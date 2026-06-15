@@ -1,0 +1,13 @@
+Hi{% if display_name %} {{ display_name }}{% endif %},
+
+You're receiving this email because you submitted this address at the FOSS Launchpad.
+
+To verify your email and enable notifications from the FOSS apps, please click:
+
+{{ verification_url }}
+
+This link expires in {{ expiry_hours }} hours.
+
+If you didn't submit this email, you can safely ignore this message.
+
+— FOSS Launchpad (Moneta)
