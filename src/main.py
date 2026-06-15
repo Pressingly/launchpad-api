@@ -3,6 +3,7 @@ import secrets as _secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import RedirectResponse
 
 from src import consent_text, db
 from src.config import settings
@@ -97,3 +98,28 @@ async def submit_email(
         "state": "pending_verification",
         "verification_expires_at": expires.isoformat(),
     }
+
+
+@app.get("/api/verify")
+async def verify_email(token: str, request: Request):
+    sid = await db.mark_verified(token)
+
+    portal = f"{settings.platform_protocol}://{settings.platform_domain}/"
+
+    if sid is None:
+        return RedirectResponse(
+            url=f"{portal}?verify_error=expired_or_invalid",
+            status_code=302,
+        )
+
+    await db.insert_audit(
+        synthetic_id=sid,
+        action="verify_email",
+        email=None,
+        consent_text_version=None,
+        consent_text_content=None,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+
+    return RedirectResponse(url=f"{portal}?verified=1", status_code=302)
