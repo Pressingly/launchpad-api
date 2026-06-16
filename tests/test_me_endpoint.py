@@ -19,7 +19,7 @@ async def test_me_returns_not_collected(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
     response = await client.get(
         "/api/me",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
     )
     assert response.status_code == 200
     assert response.json() == {"state": "not_collected"}
@@ -32,7 +32,7 @@ async def test_me_returns_pending_verification(client, cleanup_test_users):
 
     response = await client.get(
         "/api/me",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
     )
     assert response.status_code == 200
     body = response.json()
@@ -49,7 +49,7 @@ async def test_me_returns_verified(client, cleanup_test_users):
 
     response = await client.get(
         "/api/me",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
     )
     assert response.status_code == 200
     body = response.json()

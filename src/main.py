@@ -12,12 +12,13 @@ from src.models import EmailSubmitRequest, UserStateResponse
 app = FastAPI(title="launchpad-api", docs_url=None, redoc_url=None)
 
 
-def extract_synthetic_id(x_auth_request_email: str) -> str:
-    """Extract the synthetic ID portion from the X-Auth-Request-Email header.
-    Expected format: <synthetic_id>@askii.ai"""
-    if not x_auth_request_email or "@" not in x_auth_request_email:
-        raise HTTPException(status_code=400, detail="Invalid X-Auth-Request-Email")
-    return x_auth_request_email.split("@", 1)[0]
+def extract_synthetic_id(x_auth_request_preferred_username: str) -> str:
+    """Read the synthetic_id from the X-Auth-Request-Preferred-Username header.
+    mpass-auth-proxy stamps this claim with the stable synthetic_id regardless
+    of whether the user's email has been overlaid with a real address."""
+    if not x_auth_request_preferred_username:
+        raise HTTPException(status_code=400, detail="Missing X-Auth-Request-Preferred-Username")
+    return x_auth_request_preferred_username
 
 
 @app.get("/api/health")
@@ -26,8 +27,8 @@ async def health():
 
 
 @app.get("/api/me", response_model=UserStateResponse, response_model_exclude_none=True)
-async def get_me(x_auth_request_email: str = Header(default="")):
-    sid = extract_synthetic_id(x_auth_request_email)
+async def get_me(x_auth_request_preferred_username: str = Header(default="")):
+    sid = extract_synthetic_id(x_auth_request_preferred_username)
     user = await db.fetch_user(sid)
 
     if user is None:
@@ -52,9 +53,9 @@ async def get_me(x_auth_request_email: str = Header(default="")):
 async def submit_email(
     payload: EmailSubmitRequest,
     request: Request,
-    x_auth_request_email: str = Header(default=""),
+    x_auth_request_preferred_username: str = Header(default=""),
 ):
-    sid = extract_synthetic_id(x_auth_request_email)
+    sid = extract_synthetic_id(x_auth_request_preferred_username)
 
     if not consent_text.is_valid_version(payload.consent_text_version):
         raise HTTPException(status_code=400, detail="Unknown consent_text_version")
@@ -126,8 +127,8 @@ async def verify_email(token: str, request: Request):
 
 
 @app.post("/api/email/resend")
-async def resend_verification(request: Request, x_auth_request_email: str = Header(default="")):
-    sid = extract_synthetic_id(x_auth_request_email)
+async def resend_verification(request: Request, x_auth_request_preferred_username: str = Header(default="")):
+    sid = extract_synthetic_id(x_auth_request_preferred_username)
     user = await db.fetch_user(sid)
 
     if user is None:
@@ -167,8 +168,8 @@ async def resend_verification(request: Request, x_auth_request_email: str = Head
 
 
 @app.post("/api/dismiss", status_code=204)
-async def dismiss(request: Request, x_auth_request_email: str = Header(default="")):
-    sid = extract_synthetic_id(x_auth_request_email)
+async def dismiss(request: Request, x_auth_request_preferred_username: str = Header(default="")):
+    sid = extract_synthetic_id(x_auth_request_preferred_username)
 
     await db.insert_audit(
         synthetic_id=sid,

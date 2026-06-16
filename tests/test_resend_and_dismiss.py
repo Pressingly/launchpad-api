@@ -22,7 +22,7 @@ async def test_resend_for_pending_user(client, cleanup_test_users):
 
     response = await client.post(
         "/api/email/resend",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
     )
     assert response.status_code == 200
 
@@ -38,7 +38,7 @@ async def test_resend_rejects_already_verified(client, cleanup_test_users):
 
     response = await client.post(
         "/api/email/resend",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
     )
     assert response.status_code == 400
 
@@ -47,7 +47,7 @@ async def test_resend_rejects_not_collected(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
     response = await client.post(
         "/api/email/resend",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
     )
     assert response.status_code == 400
 
@@ -56,7 +56,7 @@ async def test_dismiss_writes_audit(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
     response = await client.post(
         "/api/dismiss",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
     )
     assert response.status_code == 204
 

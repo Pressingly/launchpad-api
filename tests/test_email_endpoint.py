@@ -18,7 +18,7 @@ async def test_submit_email_creates_user_and_audit(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
     response = await client.post(
         "/api/email",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
         json={
             "email": "jane@example.com",
             "display_name": "Jane",
@@ -41,7 +41,7 @@ async def test_submit_email_rejects_bad_email(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
     response = await client.post(
         "/api/email",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
         json={
             "email": "not-an-email",
             "display_name": None,
@@ -56,7 +56,7 @@ async def test_submit_email_rejects_no_consent(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
     response = await client.post(
         "/api/email",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
         json={
             "email": "jane@example.com",
             "display_name": None,
@@ -71,7 +71,7 @@ async def test_submit_email_rejects_unknown_consent_version(client, cleanup_test
     sid = f"test_{secrets.token_hex(4)}"
     response = await client.post(
         "/api/email",
-        headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
         json={
             "email": "jane@example.com",
             "display_name": None,
@@ -87,7 +87,7 @@ async def test_submit_email_idempotent_for_unverified(client, cleanup_test_users
     for email in ["first@example.com", "second@example.com"]:
         response = await client.post(
             "/api/email",
-            headers={"X-Auth-Request-Email": f"{sid}@askii.ai"},
+            headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
             json={
                 "email": email,
                 "display_name": None,
