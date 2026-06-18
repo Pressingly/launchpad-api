@@ -119,7 +119,7 @@ async def submit_email(
         )
     except Exception as exc:
         # In a real implementation, log this properly. For now print.
-        print(f"WARN: verification email send failed: {exc}")
+        logger.warning("verification email send failed: %s", exc)
 
     return {
         "state": "pending_verification",
@@ -188,7 +188,7 @@ async def resend_verification(request: Request, x_auth_request_preferred_usernam
             verification_token=new_token,
         )
     except Exception as exc:
-        print(f"WARN: resend email send failed: {exc}")
+        logger.warning("resend email send failed: %s", exc)
 
     return {"status": "ok"}
 
