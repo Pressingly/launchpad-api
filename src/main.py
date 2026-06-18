@@ -1,5 +1,7 @@
 """launchpad-api — FastAPI service for email collection and verification."""
+import logging
 import secrets as _secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
@@ -9,7 +11,31 @@ from src import consent_text, db
 from src.config import settings
 from src.models import EmailSubmitRequest, UserStateResponse
 
-app = FastAPI(title="launchpad-api", docs_url=None, redoc_url=None)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def _warn_if_dev_smtp_in_prod(smtp_host: str) -> None:
+    """Warn if SMTP_HOST looks dev-only. Mailpit is the dev-stack fake SMTP
+    catcher; if this value leaks into staging or production (e.g. by inheriting
+    the dev .env), verification emails will fail to deliver. Loud-and-early
+    beats silent-and-late."""
+    if smtp_host == "mailpit":
+        logger.warning(
+            "LAUNCHPAD_SMTP_HOST=mailpit detected. Mailpit is the dev-only "
+            "fake SMTP catcher; if this is staging or production, verification "
+            "emails will fail to send. See dev/docs/deploy-smtp.md for correct "
+            "configuration."
+        )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _warn_if_dev_smtp_in_prod(settings.smtp_host)
+    yield
+
+
+app = FastAPI(title="launchpad-api", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
 def extract_synthetic_id(x_auth_request_preferred_username: str) -> str:
