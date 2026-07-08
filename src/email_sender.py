@@ -7,7 +7,7 @@ from typing import Optional
 
 import aiosmtplib
 from aiosmtplib.errors import SMTPRecipientsRefused, SMTPAuthenticationError
-from jinja2 import Template
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from src.config import settings
 
@@ -24,10 +24,16 @@ _MAX_ATTEMPTS = 3
 _INITIAL_BACKOFF_SECONDS = 1.0
 
 
+# Autoescape HTML templates so user-provided values (e.g. display_name) can't inject
+# markup into the HTML email; the plain-text .txt template is left literal.
+_jinja_env = Environment(
+    loader=FileSystemLoader(str(TEMPLATE_DIR)),
+    autoescape=select_autoescape(["html"]),
+)
+
+
 def _render(template_name: str, **kwargs) -> str:
-    path = TEMPLATE_DIR / template_name
-    template = Template(path.read_text())
-    return template.render(**kwargs)
+    return _jinja_env.get_template(template_name).render(**kwargs)
 
 
 async def _send_with_retry(msg: EmailMessage, smtp_kwargs: dict) -> None:
