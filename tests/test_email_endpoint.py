@@ -99,3 +99,53 @@ async def test_submit_email_idempotent_for_unverified(client, cleanup_test_users
 
     user = await db.fetch_user(sid)
     assert user["real_email"] == "second@example.com"
+
+
+async def test_submit_email_duplicate_across_accounts_returns_409(client, cleanup_test_users):
+    """A second synthetic_id submitting an email another account already
+    registered must get a clean 409 (not an uncaught UniqueViolation -> 500)."""
+    email = "shared-alias@example.com"
+    sid1 = f"test_{secrets.token_hex(4)}"
+    sid2 = f"test_{secrets.token_hex(4)}"
+
+    first = await client.post(
+        "/api/email",
+        headers={"X-Auth-Request-Preferred-Username": sid1},
+        json={"email": email, "display_name": None, "consent": True, "consent_text_version": "v1.0"},
+    )
+    assert first.status_code == 202
+
+    second = await client.post(
+        "/api/email",
+        headers={"X-Auth-Request-Preferred-Username": sid2},
+        json={"email": email, "display_name": None, "consent": True, "consent_text_version": "v1.0"},
+    )
+    assert second.status_code == 409
+    assert "already registered" in second.json()["detail"].lower()
+
+    # The second account must not have been created by the failed insert.
+    assert await db.fetch_user(sid2) is None
+
+
+async def test_submit_email_audit_records_forwarded_client_ip(client, cleanup_test_users):
+    """The consent audit must record the real client IP from X-Forwarded-For
+    (left-most entry), not the internal proxy hop."""
+    sid = f"test_{secrets.token_hex(4)}"
+    response = await client.post(
+        "/api/email",
+        headers={
+            "X-Auth-Request-Preferred-Username": sid,
+            "X-Forwarded-For": "203.0.113.7, 172.18.0.5",
+        },
+        json={"email": "fwd@example.com", "display_name": None, "consent": True, "consent_text_version": "v1.0"},
+    )
+    assert response.status_code == 202
+
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        ip = await conn.fetchval(
+            "SELECT ip_address FROM foss_users_audit "
+            "WHERE synthetic_id = $1 AND action = 'submit_email'",
+            sid,
+        )
+    assert str(ip) == "203.0.113.7"

@@ -7,6 +7,20 @@ import asyncpg
 from src.config import settings
 
 
+class EmailAlreadyRegistered(Exception):
+    """A real_email is already claimed by a *different* synthetic_id.
+
+    foss_users has a UNIQUE index on real_email (idx_foss_users_email). Since
+    insert_user already absorbs synthetic_id collisions via ON CONFLICT, the
+    only remaining unique violation is a second account submitting an email
+    that another account already registered. The API layer maps this to a 409
+    with a clear message rather than letting it surface as an uncaught 500."""
+
+    def __init__(self, email: str):
+        self.email = email
+        super().__init__(f"email already registered: {email}")
+
+
 _pool: Optional[asyncpg.Pool] = None
 
 
@@ -57,24 +71,34 @@ async def insert_user(
     """Insert a new (unverified) foss_users row, or update if it already exists."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO foss_users (
-                synthetic_id, real_email, display_name,
+        try:
+            await conn.execute(
+                """
+                INSERT INTO foss_users (
+                    synthetic_id, real_email, display_name,
+                    verification_token, verification_expires,
+                    verified, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, FALSE, now())
+                ON CONFLICT (synthetic_id) DO UPDATE
+                SET real_email = EXCLUDED.real_email,
+                    display_name = EXCLUDED.display_name,
+                    verification_token = EXCLUDED.verification_token,
+                    verification_expires = EXCLUDED.verification_expires,
+                    verified = FALSE,
+                    updated_at = now()
+                """,
+                synthetic_id, email, display_name,
                 verification_token, verification_expires,
-                verified, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, FALSE, now())
-            ON CONFLICT (synthetic_id) DO UPDATE
-            SET real_email = EXCLUDED.real_email,
-                display_name = EXCLUDED.display_name,
-                verification_token = EXCLUDED.verification_token,
-                verification_expires = EXCLUDED.verification_expires,
-                verified = FALSE,
-                updated_at = now()
-            """,
-            synthetic_id, email, display_name,
-            verification_token, verification_expires,
-        )
+            )
+        except asyncpg.UniqueViolationError as exc:
+            # ON CONFLICT (synthetic_id) already absorbs synthetic_id collisions
+            # (both on INSERT and on the UPDATE branch), so the only unique
+            # violation that can reach here is the real_email index: this email
+            # is already registered by a different account. Surface a domain
+            # error the API maps to 409 instead of an unrecoverable 500.
+            if "email" in (exc.constraint_name or ""):
+                raise EmailAlreadyRegistered(email) from exc
+            raise
 
 
 async def mark_verified(token: str) -> Optional[str]:

@@ -1,8 +1,10 @@
 """launchpad-api — FastAPI service for email collection and verification."""
+import ipaddress
 import logging
 import secrets as _secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import RedirectResponse, Response
@@ -36,6 +38,26 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="launchpad-api", docs_url=None, redoc_url=None, lifespan=lifespan)
+
+
+def _client_ip(request: Request) -> Optional[str]:
+    """Best-effort real client IP for the consent audit record.
+
+    Behind Traefik -> oauth2-proxy -> launchpad-api, request.client.host is the
+    internal container IP (e.g. 172.18.0.x), which is useless as a consent
+    record. Traefik sets X-Forwarded-For, whose left-most entry is the original
+    client. Validate it before use so a malformed or spoofed header can't 500
+    the audit insert (the ip_address column is cast ::inet); fall back to the
+    direct peer address when there's no usable forwarded value."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        candidate = forwarded.split(",")[0].strip()
+        try:
+            ipaddress.ip_address(candidate)
+            return candidate
+        except ValueError:
+            pass
+    return request.client.host if request.client else None
 
 
 def extract_synthetic_id(x_auth_request_preferred_username: str) -> str:
@@ -91,13 +113,23 @@ async def submit_email(
         hours=settings.verification_link_expiry_hours
     )
 
-    await db.insert_user(
-        synthetic_id=sid,
-        email=str(payload.email),
-        display_name=payload.display_name,
-        verification_token=token,
-        verification_expires=expires,
-    )
+    try:
+        await db.insert_user(
+            synthetic_id=sid,
+            email=str(payload.email),
+            display_name=payload.display_name,
+            verification_token=token,
+            verification_expires=expires,
+        )
+    except db.EmailAlreadyRegistered:
+        # Another account already registered this email (unique real_email
+        # index). Return a terminal 409 with a clear message the frontend
+        # surfaces via body.detail — not an uncaught 500 that leaves the user
+        # in a hopeless retry loop.
+        raise HTTPException(
+            status_code=409,
+            detail="This email is already registered by another account.",
+        )
 
     await db.insert_audit(
         synthetic_id=sid,
@@ -105,7 +137,7 @@ async def submit_email(
         email=str(payload.email),
         consent_text_version=payload.consent_text_version,
         consent_text_content=consent_text.get_text(payload.consent_text_version),
-        ip_address=request.client.host if request.client else None,
+        ip_address=_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
 
@@ -129,6 +161,11 @@ async def submit_email(
 
 @app.get("/api/verify")
 async def verify_email(token: str, request: Request):
+    # NOTE: this GET is state-mutating (consumes the one-use token). Enterprise
+    # mail scanners / link-prefetchers can therefore "click" the link before the
+    # user does and mark them verified early. That outcome is benign here (the
+    # user still ends up verified), but if this endpoint ever gains
+    # side-effects beyond verification, gate it behind an interstitial POST.
     sid = await db.mark_verified(token)
 
     portal = f"{settings.platform_protocol}://{settings.platform_domain}/"
@@ -145,7 +182,7 @@ async def verify_email(token: str, request: Request):
         email=None,
         consent_text_version=None,
         consent_text_content=None,
-        ip_address=request.client.host if request.client else None,
+        ip_address=_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
 
@@ -176,7 +213,7 @@ async def resend_verification(request: Request, x_auth_request_preferred_usernam
         email=user["real_email"],
         consent_text_version=None,
         consent_text_content=None,
-        ip_address=request.client.host if request.client else None,
+        ip_address=_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
 
@@ -203,7 +240,7 @@ async def dismiss(request: Request, x_auth_request_preferred_username: str = Hea
         email=None,
         consent_text_version=None,
         consent_text_content=None,
-        ip_address=request.client.host if request.client else None,
+        ip_address=_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
 
