@@ -52,17 +52,10 @@ async def test_resend_rejects_not_collected(client, cleanup_test_users):
     assert response.status_code == 400
 
 
-async def test_dismiss_writes_audit(client, cleanup_test_users):
+async def test_dismiss_is_retired_410(client):
     sid = f"test_{secrets.token_hex(4)}"
     response = await client.post(
         "/api/dismiss",
         headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
     )
-    assert response.status_code == 204
-
-    pool = await db.get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT action FROM foss_users_audit WHERE synthetic_id = $1", sid
-        )
-    assert row["action"] == "dismiss_modal"
+    assert response.status_code == 410

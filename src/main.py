@@ -285,18 +285,13 @@ async def resend_verification(request: Request, x_auth_request_preferred_usernam
     return {"status": "ok"}
 
 
-@app.post("/api/dismiss", status_code=204)
-async def dismiss(request: Request, x_auth_request_preferred_username: str = Header(default="")):
-    sid = extract_synthetic_id(x_auth_request_preferred_username)
-
-    await db.insert_audit(
-        synthetic_id=sid,
-        action="dismiss_modal",
-        email=None,
-        consent_text_version=None,
-        consent_text_content=None,
-        ip_address=_client_ip(request),
-        user_agent=request.headers.get("user-agent"),
+@app.post("/api/dismiss", status_code=410)
+async def dismiss():
+    """Retired. Providing a verified email is now mandatory and enforced at the
+    edge by the verify-gate (ADR-0018), so there is no "dismiss" anymore. Kept
+    as an explicit 410 (not deleted) so a cached frontend still calling it gets
+    a clear, intentional signal rather than a 404 that reads as a routing bug."""
+    raise HTTPException(
+        status_code=410,
+        detail="dismiss is retired; a verified email is mandatory",
     )
-
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
