@@ -1,6 +1,7 @@
 """Integration tests for the edge verify-gate endpoint GET /api/authz."""
 import secrets
-from datetime import datetime, timedelta, timezone
+import urllib.parse
+from datetime import timedelta, timezone
 
 import pytest
 
@@ -17,6 +18,7 @@ async def cleanup_test_users():
 
 
 async def _mk_verified(sid: str, email: str):
+    from datetime import datetime
     expires = datetime.now(timezone.utc) + timedelta(hours=24)
     await db.insert_user(sid, email, "Jane", "tok_" + sid, expires)
     await db.mark_verified("tok_" + sid)
@@ -66,6 +68,7 @@ async def test_authz_403_json_for_unverified_api_client(client, cleanup_test_use
     )
     assert r.status_code == 403
     assert r.json()["error"] == "email_verification_required"
+    assert "verify_url" in r.json()
 
 
 async def test_authz_refreshes_stale_synthetic_token(client, cleanup_test_users):
@@ -85,9 +88,10 @@ async def test_authz_refreshes_stale_synthetic_token(client, cleanup_test_users)
         follow_redirects=False,
     )
     assert r.status_code == 302
-    assert r.headers["location"].startswith(
-        "https://pm.foss.local.dev/oauth2/sign_in?prompt=none&rd="
-    )
+    loc = r.headers["location"]
+    assert loc.startswith("https://pm.foss.local.dev/oauth2/sign_in?prompt=none&rd=")
+    rd = urllib.parse.parse_qs(urllib.parse.urlsplit(loc).query)["rd"]
+    assert rd == ["https://pm.foss.local.dev/projects"]
 
 
 async def test_authz_allows_stale_token_for_api_client(client, cleanup_test_users):
