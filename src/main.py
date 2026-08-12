@@ -7,9 +7,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import RedirectResponse, Response
+from urllib.parse import quote
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from src import consent_text, db
+from src.gate import GateAction, decide_gate, verified_state
 from src.config import settings
 from src.models import EmailSubmitRequest, UserStateResponse
 
@@ -94,6 +96,59 @@ async def get_me(x_auth_request_preferred_username: str = Header(default="")):
         state="pending_verification",
         email=user["real_email"],
         verification_expires_at=user["verification_expires"],
+    )
+
+
+@app.get("/api/authz")
+async def authz(
+    request: Request,
+    x_auth_request_preferred_username: str = Header(default=""),
+    x_auth_request_email: str = Header(default=""),
+):
+    """Edge verify-gate (ADR-0018). Traefik ForwardAuth calls this after the
+    mpass-auth login check on every *application* router. It never runs for the
+    portal or /api/* routers, so an unverified user can always reach the
+    collection flow."""
+    sid = x_auth_request_preferred_username
+    if not sid:
+        # mpass-auth runs before this gate, so identity is always present in a
+        # correct config. Its absence means a wiring mistake — fail closed.
+        raise HTTPException(status_code=401, detail="missing identity")
+
+    verified, _ = await verified_state(sid, settings.gate_cache_ttl_seconds)
+    action = decide_gate(
+        verified=verified,
+        email=x_auth_request_email,
+        sid=sid,
+        synthetic_domain=settings.synthetic_email_domain,
+    )
+    wants_html = "text/html" in request.headers.get("accept", "")
+
+    if action is GateAction.ALLOW:
+        return Response(status_code=200)
+
+    proto = request.headers.get("x-forwarded-proto", settings.platform_protocol)
+    host = request.headers.get("x-forwarded-host", settings.platform_domain)
+
+    if action is GateAction.REFRESH:
+        if not wants_html:
+            # A programmatic caller tolerates a briefly-stale email until its
+            # session refreshes; never 302 an API/MCP client.
+            return Response(status_code=200)
+        uri = request.headers.get("x-forwarded-uri", "/")
+        rd = quote(f"{proto}://{host}{uri}", safe="")
+        return RedirectResponse(
+            url=f"{proto}://{host}/oauth2/sign_in?prompt=none&rd={rd}",
+            status_code=302,
+        )
+
+    # action is GateAction.COLLECT
+    portal = f"{settings.platform_protocol}://{settings.platform_domain}/?collect=1"
+    if wants_html:
+        return RedirectResponse(url=portal, status_code=302)
+    return JSONResponse(
+        status_code=403,
+        content={"error": "email_verification_required", "verify_url": portal},
     )
 
 

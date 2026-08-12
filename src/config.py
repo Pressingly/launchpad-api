@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     platform_domain: str = "foss.local.dev"
     verification_link_expiry_hours: int = 24
 
+    # Verify-gate (ADR-0018)
+    synthetic_email_domain: str = "askii.ai"
+    gate_cache_ttl_seconds: int = 10
+
     class Config:
         env_file = ".env"
         env_prefix = ""
