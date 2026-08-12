@@ -5,9 +5,9 @@ import secrets as _secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-
-from fastapi import FastAPI, Header, HTTPException, Request, status
 from urllib.parse import quote
+
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from src import consent_text, db
