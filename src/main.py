@@ -32,8 +32,27 @@ def _warn_if_dev_smtp_in_prod(smtp_host: str) -> None:
         )
 
 
+def _require_db_password() -> None:
+    """Fail loudly at startup rather than at the first request.
+
+    launchpad-api only runs under the `launchpad` compose profile, i.e. only
+    when email capture is enabled -- so reaching here with no password means a
+    half-configured enable. Without this the service starts healthy (its
+    healthcheck does not touch the database) and every submission 500s.
+    """
+    if not settings.db_password:
+        raise RuntimeError(
+            "DB_PASSWORD is empty. Set LAUNCHPAD_DB_PASSWORD in .env "
+            "(platform.sh generates it on a fresh install; existing deployments "
+            "must add it by hand -- see dev/docs/launchpad-runbook.md)."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # In lifespan rather than at import: the module must stay importable without
+    # a database password so tests that do not need one can run.
+    _require_db_password()
     _warn_if_dev_smtp_in_prod(settings.smtp_host)
     yield
 

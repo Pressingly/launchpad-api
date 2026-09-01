@@ -8,7 +8,12 @@ class Settings(BaseSettings):
     db_port: int = 5432
     db_name: str = "launchpad"
     db_user: str = "launchpad_api_user"
-    db_password: str
+    # No required-value default. Compose cannot make a required-variable guard
+    # conditional (it interpolates every service regardless of profiles), so
+    # DB_PASSWORD arrives as an empty string when the feature is off. Validating
+    # at import instead would make the module unimportable without a database
+    # password, which blocks any test job that does not need one.
+    db_password: str = ""
 
     # SMTP
     smtp_host: str = "mailpit"
