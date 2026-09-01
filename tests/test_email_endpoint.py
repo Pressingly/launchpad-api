@@ -2,7 +2,7 @@
 import pytest
 import secrets
 
-from src import db
+from src import consent_text, db
 
 
 @pytest.fixture
@@ -23,7 +23,7 @@ async def test_submit_email_creates_user_and_audit(client, cleanup_test_users):
             "email": "jane@example.com",
             "display_name": "Jane",
             "consent": True,
-            "consent_text_version": "v1.0",
+            "consent_text_version": consent_text.CURRENT_VERSION,
         },
     )
     assert response.status_code == 202
@@ -46,7 +46,7 @@ async def test_submit_email_rejects_bad_email(client, cleanup_test_users):
             "email": "not-an-email",
             "display_name": None,
             "consent": True,
-            "consent_text_version": "v1.0",
+            "consent_text_version": consent_text.CURRENT_VERSION,
         },
     )
     assert response.status_code == 422
@@ -61,7 +61,7 @@ async def test_submit_email_rejects_no_consent(client, cleanup_test_users):
             "email": "jane@example.com",
             "display_name": None,
             "consent": False,
-            "consent_text_version": "v1.0",
+            "consent_text_version": consent_text.CURRENT_VERSION,
         },
     )
     assert response.status_code == 422
@@ -92,7 +92,7 @@ async def test_submit_email_idempotent_for_unverified(client, cleanup_test_users
                 "email": email,
                 "display_name": None,
                 "consent": True,
-                "consent_text_version": "v1.0",
+                "consent_text_version": consent_text.CURRENT_VERSION,
             },
         )
         assert response.status_code == 202
@@ -111,14 +111,14 @@ async def test_submit_email_duplicate_across_accounts_returns_409(client, cleanu
     first = await client.post(
         "/api/email",
         headers={"X-Auth-Request-Preferred-Username": sid1},
-        json={"email": email, "display_name": None, "consent": True, "consent_text_version": "v1.0"},
+        json={"email": email, "display_name": None, "consent": True, "consent_text_version": consent_text.CURRENT_VERSION},
     )
     assert first.status_code == 202
 
     second = await client.post(
         "/api/email",
         headers={"X-Auth-Request-Preferred-Username": sid2},
-        json={"email": email, "display_name": None, "consent": True, "consent_text_version": "v1.0"},
+        json={"email": email, "display_name": None, "consent": True, "consent_text_version": consent_text.CURRENT_VERSION},
     )
     assert second.status_code == 409
     assert "already registered" in second.json()["detail"].lower()
@@ -137,7 +137,7 @@ async def test_submit_email_audit_records_forwarded_client_ip(client, cleanup_te
             "X-Auth-Request-Preferred-Username": sid,
             "X-Forwarded-For": "203.0.113.7, 172.18.0.5",
         },
-        json={"email": "fwd@example.com", "display_name": None, "consent": True, "consent_text_version": "v1.0"},
+        json={"email": "fwd@example.com", "display_name": None, "consent": True, "consent_text_version": consent_text.CURRENT_VERSION},
     )
     assert response.status_code == 202
 
@@ -149,3 +149,41 @@ async def test_submit_email_audit_records_forwarded_client_ip(client, cleanup_te
             sid,
         )
     assert str(ip) == "203.0.113.7"
+
+
+async def test_retired_consent_version_is_rejected(client):
+    """v1.0 named an app that has since been removed from the bundle and omitted
+    one that was added. It stays in CONSENT_TEXTS so historical audit rows still
+    render, but accepting it would let a stale client keep writing consent
+    records for the wrong roster."""
+    resp = await client.post(
+        "/api/email",
+        json={
+            "email": "retired@example.com",
+            "consent": True,
+            "consent_text_version": "v1.0",
+        },
+        headers={"X-Auth-Request-Preferred-Username": "sid-retired"},
+    )
+    assert resp.status_code == 400
+    assert "v1.1" in resp.json()["detail"]
+
+
+async def test_current_consent_version_is_accepted(client):
+    resp = await client.post(
+        "/api/email",
+        json={
+            "email": "current@example.com",
+            "consent": True,
+            "consent_text_version": consent_text.CURRENT_VERSION,
+        },
+        headers={"X-Auth-Request-Preferred-Username": "sid-current"},
+    )
+    assert resp.status_code == 202
+
+
+def test_current_version_is_present_in_consent_texts():
+    """Guard: CURRENT_VERSION must resolve, or every submission 500s on get_text."""
+    assert consent_text.CURRENT_VERSION in consent_text.CONSENT_TEXTS
+    assert consent_text.is_known_version("v1.0")
+    assert not consent_text.is_valid_version("v1.0")

@@ -106,7 +106,16 @@ async def submit_email(
     sid = extract_synthetic_id(x_auth_request_preferred_username)
 
     if not consent_text.is_valid_version(payload.consent_text_version):
-        raise HTTPException(status_code=400, detail="Unknown consent_text_version")
+        # A retired version is "known" but not acceptable -- say so, because the
+        # usual cause is a cached client, and "unknown" sends the reader hunting
+        # for a typo instead of reloading.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"consent_text_version must be {consent_text.CURRENT_VERSION}; "
+                "reload the page to pick up the current consent text."
+            ),
+        )
 
     token = _secrets.token_urlsafe(32)
     expires = datetime.now(timezone.utc) + timedelta(
