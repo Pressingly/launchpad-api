@@ -45,11 +45,6 @@ def is_valid_version(version: str) -> bool:
     return version == CURRENT_VERSION
 
 
-def is_known_version(version: str) -> bool:
-    """True for any version ever published, including retired ones. Use this to
-    render a historical audit row, never to validate an incoming submission."""
-    return version in CONSENT_TEXTS
-
 
 def get_text(version: str) -> str:
     return CONSENT_TEXTS[version]

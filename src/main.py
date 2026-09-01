@@ -24,7 +24,8 @@ def _warn_if_dev_smtp_in_prod(smtp_host: str) -> None:
     beats silent-and-late."""
     if smtp_host == "mailpit":
         logger.warning(
-            "LAUNCHPAD_SMTP_HOST=mailpit detected. Mailpit is the dev-only "
+            "SMTP_HOST=mailpit detected (set from LAUNCHPAD_SMTP_HOST in .env "
+            "under compose). Mailpit is the dev-only "
             "fake SMTP catcher; if this is staging or production, verification "
             "emails will fail to send. See dev/docs/deploy-smtp.md for correct "
             "configuration."
