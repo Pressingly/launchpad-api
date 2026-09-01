@@ -29,8 +29,21 @@ CONSENT_TEXTS = {
 }
 
 
+# The version new submissions must carry. CONSENT_TEXTS deliberately keeps every
+# older entry so historical foss_users_audit rows still render exactly what their
+# user was shown -- but an old version must not be *accepted* going forward, or a
+# stale client (a cached index.html, an out-of-date inlined copy, a direct API
+# caller) keeps writing consent records for an app roster that no longer matches
+# the platform. The server decides the current version, not the caller.
+CURRENT_VERSION = "v1.1"
+
+
 def is_valid_version(version: str) -> bool:
-    return version in CONSENT_TEXTS
+    """True only for the version new submissions must carry.
+
+    Not "is this a version we know about" -- see CURRENT_VERSION."""
+    return version == CURRENT_VERSION
+
 
 
 def get_text(version: str) -> str:
