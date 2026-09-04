@@ -1,18 +1,8 @@
 """Tests for GET /api/me."""
-import pytest
 import secrets
-from datetime import datetime, timedelta, timezone
 
 from src import db
-
-
-@pytest.fixture
-async def cleanup_test_users():
-    yield
-    pool = await db.get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM foss_users WHERE synthetic_id LIKE 'test_%'")
-        await conn.execute("DELETE FROM foss_users_audit WHERE synthetic_id LIKE 'test_%'")
+from tests.conftest import seed_pending
 
 
 async def test_me_returns_not_collected(client, cleanup_test_users):
@@ -27,8 +17,7 @@ async def test_me_returns_not_collected(client, cleanup_test_users):
 
 async def test_me_returns_pending_verification(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
-    expires = datetime.now(timezone.utc) + timedelta(hours=24)
-    await db.insert_user(sid, "jane@example.com", "Jane", "tok123", expires)
+    await seed_pending(sid, "jane@example.com", "tok123")
 
     response = await client.get(
         "/api/me",
@@ -43,9 +32,9 @@ async def test_me_returns_pending_verification(client, cleanup_test_users):
 
 async def test_me_returns_verified(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
-    expires = datetime.now(timezone.utc) + timedelta(hours=24)
-    await db.insert_user(sid, "jane@example.com", "Jane", "tok123", expires)
-    await db.mark_verified("tok123")
+    await seed_pending(sid, "jane@example.com", "tok123")
+    verified = await client.get("/api/verify?token=tok123", follow_redirects=False)
+    assert "verified=1" in verified.headers["location"]
 
     response = await client.get(
         "/api/me",

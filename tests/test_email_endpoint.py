@@ -101,10 +101,16 @@ async def test_submit_email_idempotent_for_unverified(client, cleanup_test_users
     assert user["real_email"] == "second@example.com"
 
 
-async def test_submit_email_duplicate_across_accounts_returns_409(client, cleanup_test_users):
-    """A second synthetic_id submitting an email another account already
-    registered must get a clean 409 (not an uncaught UniqueViolation -> 500)."""
-    email = "shared-alias@example.com"
+async def test_submit_email_duplicate_across_accounts_is_accepted(client, cleanup_test_users):
+    """Rewritten for PRD §1.1/§2.2. This used to assert a 409, which was the
+    enumeration oracle: it told an unauthenticated-by-address caller whether a
+    given address was on the platform. With a partial unique index an
+    unverified claim is non-binding, so both submits are ordinary 202s.
+
+    The full ownership and no-oracle matrix lives in test_prc_ownership.py and
+    test_prc_no_oracle.py; this keeps the original case's intent visible in
+    the file where it was written."""
+    email = f"shared-{secrets.token_hex(4)}@example.com"
     sid1 = f"test_{secrets.token_hex(4)}"
     sid2 = f"test_{secrets.token_hex(4)}"
 
@@ -120,11 +126,9 @@ async def test_submit_email_duplicate_across_accounts_returns_409(client, cleanu
         headers={"X-Auth-Request-Preferred-Username": sid2},
         json={"email": email, "display_name": None, "consent": True, "consent_text_version": consent_text.CURRENT_VERSION},
     )
-    assert second.status_code == 409
-    assert "already registered" in second.json()["detail"].lower()
+    assert second.status_code == 202
 
-    # The second account must not have been created by the failed insert.
-    assert await db.fetch_user(sid2) is None
+    assert (await db.fetch_user(sid2)) is not None
 
 
 async def test_submit_email_audit_records_forwarded_client_ip(client, cleanup_test_users):

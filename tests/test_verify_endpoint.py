@@ -1,24 +1,19 @@
 """Tests for GET /api/verify."""
-import pytest
 import secrets
 from datetime import datetime, timedelta, timezone
 
 from src import db
+from tests.conftest import seed_pending
 
-
-@pytest.fixture
-async def cleanup_test_users():
-    yield
-    pool = await db.get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM foss_users WHERE synthetic_id LIKE 'test_%'")
-        await conn.execute("DELETE FROM foss_users_audit WHERE synthetic_id LIKE 'test_%'")
+# Rows are seeded with `seed_pending`, which writes sha256(raw) into
+# verification_token directly (PRD §1.2). Going through db.insert_user would
+# couple these tests to *which layer* hashes, which the PRD deliberately
+# leaves to the implementer.
 
 
 async def test_verify_valid_token_redirects(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
-    expires = datetime.now(timezone.utc) + timedelta(hours=24)
-    await db.insert_user(sid, "jane@example.com", None, "validtok", expires)
+    await seed_pending(sid, f"jane-{secrets.token_hex(4)}@example.com", "validtok")
 
     response = await client.get("/api/verify?token=validtok", follow_redirects=False)
     assert response.status_code == 302
@@ -31,7 +26,9 @@ async def test_verify_valid_token_redirects(client, cleanup_test_users):
 async def test_verify_expired_token_redirects_with_error(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
     expires = datetime.now(timezone.utc) - timedelta(hours=1)
-    await db.insert_user(sid, "jane@example.com", None, "expiredtok", expires)
+    await seed_pending(
+        sid, f"jane-{secrets.token_hex(4)}@example.com", "expiredtok", expires=expires
+    )
 
     response = await client.get("/api/verify?token=expiredtok", follow_redirects=False)
     assert response.status_code == 302
