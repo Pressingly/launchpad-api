@@ -6,12 +6,15 @@ from src import consent_text, db
 
 
 @pytest.fixture
-async def cleanup_test_users():
+async def cleanup_test_users(admin_conn):
+    # Shadows conftest's fixture of the same name; kept in step with it. The
+    # audit DELETE runs as the superuser because launchpad_api_user has no
+    # DELETE on that table -- see the conftest fixture for why.
     yield
     pool = await db.get_pool()
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM foss_users WHERE synthetic_id LIKE 'test_%'")
-        await conn.execute("DELETE FROM foss_users_audit WHERE synthetic_id LIKE 'test_%'")
+    await admin_conn.execute("DELETE FROM foss_users_audit WHERE synthetic_id LIKE 'test_%'")
 
 
 async def test_submit_email_creates_user_and_audit(client, cleanup_test_users):
@@ -196,3 +199,48 @@ def test_current_version_is_present_in_consent_texts():
     assert consent_text.CURRENT_VERSION in consent_text.CONSENT_TEXTS
     assert "v1.0" in consent_text.CONSENT_TEXTS
     assert not consent_text.is_valid_version("v1.0")
+
+
+async def test_submit_email_blank_display_name_is_stored_as_null(client, cleanup_test_users):
+    """The browser sends an untouched optional text input as "".
+
+    End-to-end rather than model-only: the point is that the request succeeds
+    (202, not 422) and that nothing writes an empty string into the column,
+    where it would later render as a zero-width greeting in the mail template.
+    """
+    sid = f"test_{secrets.token_hex(4)}"
+    response = await client.post(
+        "/api/email",
+        headers={"X-Auth-Request-Preferred-Username": sid},
+        json={
+            "email": f"blank-{secrets.token_hex(4)}@example.com",
+            "display_name": "",
+            "consent": True,
+            "consent_text_version": consent_text.CURRENT_VERSION,
+        },
+    )
+    assert response.status_code == 202
+
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        stored = await conn.fetchval(
+            "SELECT display_name FROM foss_users WHERE synthetic_id = $1", sid
+        )
+    assert stored is None
+
+
+async def test_submit_email_rejects_newline_in_display_name(client, cleanup_test_users):
+    """A CRLF in display_name would inject lines into the plaintext
+    verification mail (verify_email.txt is not autoescaped). 422, not 202."""
+    sid = f"test_{secrets.token_hex(4)}"
+    response = await client.post(
+        "/api/email",
+        headers={"X-Auth-Request-Preferred-Username": sid},
+        json={
+            "email": f"crlf-{secrets.token_hex(4)}@example.com",
+            "display_name": "Jane\r\nBcc: victim@example.com",
+            "consent": True,
+            "consent_text_version": consent_text.CURRENT_VERSION,
+        },
+    )
+    assert response.status_code == 422

@@ -97,13 +97,23 @@ async def raw_client():
 
 
 @pytest.fixture
-async def cleanup_test_users():
-    """After each test, delete any rows created for test synthetic_ids."""
+async def cleanup_test_users(admin_conn):
+    """After each test, delete any rows created for test synthetic_ids.
+
+    Two connections, on purpose. `foss_users` is cleaned through the ordinary
+    pool because `launchpad_api_user` legitimately holds DELETE there. The audit
+    table does not grant DELETE to that role -- it is an append-only action
+    history (see postgres/init-databases.sh) -- so its cleanup goes over the
+    superuser `admin_conn`. Doing this the other way round is what a test fixture
+    should never do: it would make the suite depend on a privilege the
+    application is not supposed to have, and quietly re-open it the moment
+    somebody granted it back to keep the tests green.
+    """
     yield
     pool = await db.get_pool()
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM foss_users WHERE synthetic_id LIKE 'test_%'")
-        await conn.execute("DELETE FROM foss_users_audit WHERE synthetic_id LIKE 'test_%'")
+    await admin_conn.execute("DELETE FROM foss_users_audit WHERE synthetic_id LIKE 'test_%'")
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +215,7 @@ async def seed_pending(
     email: str,
     raw_token: str,
     expires: Optional[datetime] = None,
+    display_name: Optional[str] = None,
 ) -> None:
     """Insert an unverified row directly, storing sha256(raw_token).
 
@@ -230,7 +241,7 @@ async def seed_pending(
                 verified = FALSE,
                 updated_at = now()
             """,
-            sid, email, None, sha256_hex(raw_token), expires,
+            sid, email, display_name, sha256_hex(raw_token), expires,
         )
 
 

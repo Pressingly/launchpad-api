@@ -8,6 +8,20 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 COPY templates/ ./templates/
 
+# Drop root. The service writes nothing to disk -- it talks to Postgres, Valkey
+# and SMTP -- so it needs no ownership changes: /app is root-owned and
+# world-readable, which is what we want (the process cannot modify its own code).
+# The account is --system with no home, no shell and no password, so it exists
+# only to be a uid.
+#
+# The base tag stays `python:3.11-slim` rather than a digest on purpose. A minor
+# version is already a pin; digest-pinning an image that receives security
+# patches means a PR per patch, and .github/workflows/launchpad-tests.yml pins
+# its job container to `python:3.11-slim` to match this line -- a digest here
+# would make that comment untrue.
+RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin launchpad
+USER launchpad
+
 EXPOSE 8000
 
 # --no-access-log: /api/verify carries the raw verification token as a query

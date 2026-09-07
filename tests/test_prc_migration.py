@@ -64,6 +64,10 @@ MIGRATION_SQL = [
     "ALTER TABLE foss_users_audit ADD CONSTRAINT foss_users_audit_action_check "
     "CHECK (action IN ('submit_email', 'verify_email', 'resend_verification', "
     "'dismiss_modal', 'submit_email_collision', 'rate_limited'))",
+    # 5. The audit table is append-only; revoke DELETE from the API role. A
+    #    REVOKE of a privilege that was never granted is a no-op, which is what
+    #    makes the block safe to run against a database already in shape.
+    "REVOKE DELETE ON foss_users_audit FROM launchpad_api_user",
 ]
 
 

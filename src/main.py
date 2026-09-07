@@ -149,9 +149,15 @@ async def get_me(x_auth_request_preferred_username: str = Header(default="")):
             verified_at=user["verified_at"],
         )
 
+    # display_name is returned in both states, not just the verified one. With
+    # response_model_exclude_none=True an omitted field disappears from the
+    # payload entirely, so leaving it out here made the key vanish for exactly
+    # the users the modal is still talking to -- a client that pre-fills the
+    # form from /api/me would blank a name the user had already given.
     return UserStateResponse(
         state="pending_verification",
         email=user["real_email"],
+        display_name=user["display_name"],
         verification_expires_at=user["verification_expires"],
     )
 

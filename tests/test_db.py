@@ -9,6 +9,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
+import asyncpg
 import pytest
 
 from src import consent_text
@@ -249,3 +250,32 @@ async def test_insert_audit_records_row(cleanup_test_users):
         )
     assert row is not None
     assert row["action"] == "dismiss_modal"
+
+
+async def test_audit_table_is_append_only_for_the_api_role(cleanup_test_users):
+    """launchpad_api_user may INSERT into foss_users_audit but not DELETE.
+
+    The table is an immutable action history -- it deliberately has no FK to
+    foss_users so rows outlive the users they describe -- and nothing in db.py
+    deletes from it. Holding DELETE bought nothing and meant a compromised
+    launchpad-api could erase the consent record this feature exists to produce.
+
+    Asserting the INSERT half matters as much as the DELETE half: a revoke that
+    over-reached would break every audit write, and the service swallows some of
+    those failures.
+    """
+    sid = _sid()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO foss_users_audit (synthetic_id, action) VALUES ($1, 'submit_email')",
+            sid,
+        )
+        assert await conn.fetchval(
+            "SELECT count(*) FROM foss_users_audit WHERE synthetic_id = $1", sid
+        ) == 1
+
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await conn.execute(
+                "DELETE FROM foss_users_audit WHERE synthetic_id = $1", sid
+            )
