@@ -59,6 +59,16 @@ async def verified_state(
     return verified, email
 
 
+def evict(sid: str) -> None:
+    """Forget one sid, so the next request re-reads the database.
+
+    Called from /api/verify. Without it a user who clicks their verification
+    link and immediately opens an app is still cached as unverified for up to
+    the TTL, so the gate bounces them back to /?collect=1 -- where /api/me now
+    reports verified, so no modal renders and they see an unexplained bounce."""
+    _cache.pop(sid, None)
+
+
 def _clear_cache() -> None:
-    """Drop all memoized entries (used by tests and hot-path safety)."""
+    """Drop every memoized entry. Test helper only."""
     _cache.clear()

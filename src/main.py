@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from src import consent_text, db, rate_limit
 from src.gate import GateAction, decide_gate, verified_state
+from src.gate import evict as gate_evict
 from src.config import settings
 from src.models import EmailSubmitRequest, UserStateResponse
 
@@ -180,7 +181,43 @@ async def authz(
         # correct config. Its absence means a wiring mistake — fail closed.
         raise HTTPException(status_code=401, detail="missing identity")
 
-    verified, _ = await verified_state(sid, settings.gate_cache_ttl_seconds)
+    if not settings.synthetic_email_domain:
+        # Without it, decide_gate compares against f"{sid}@" -- a string no real
+        # address matches -- so REFRESH never fires and a verified user holding a
+        # stale token is waved through carrying the synthetic address. That is
+        # the duplicate this gate exists to prevent, so refuse rather than run
+        # half-blind. mpass-auth-proxy dies at startup on the same missing value.
+        logger.error(
+            "authz: SYNTHETIC_EMAIL_DOMAIN is empty; refusing to gate. Set "
+            "DEFAULT_EMAIL_DOMAIN in .env -- it must match mpass-auth-proxy's."
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "gate_misconfigured",
+                "detail": "SYNTHETIC_EMAIL_DOMAIN is not configured.",
+            },
+        )
+
+    try:
+        verified, _ = await verified_state(sid, settings.gate_cache_ttl_seconds)
+    except Exception as exc:
+        # Fail closed, but deliberately and visibly. Unhandled, this became a
+        # FastAPI 500 that Traefik copied to the client, so a launchpad DB blip
+        # 500'd every gated app for every user -- including already-verified
+        # ones -- with nothing but a traceback to diagnose it. The gate runs on
+        # far more requests than /token does, so this path is hot.
+        logger.error(
+            "authz: verified-state lookup failed for sid=%s: %s: %s",
+            sid, type(exc).__name__, exc,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "verification_service_unavailable",
+                "detail": "Email verification service is temporarily unavailable.",
+            },
+        )
     action = decide_gate(
         verified=verified,
         email=x_auth_request_email,
@@ -197,13 +234,34 @@ async def authz(
 
     if action is GateAction.REFRESH:
         if not wants_html:
-            # A programmatic caller tolerates a briefly-stale email until its
-            # session refreshes; never 302 an API/MCP client.
-            return Response(status_code=200)
+            # Do NOT wave a stale programmatic caller through. This previously
+            # returned 200, which handed the app the synthetic address and let
+            # it create exactly the row this gate exists to prevent. MCP traffic
+            # is not a side channel: PLANE_BASE_URL and OUTLINE_API_URL point at
+            # the public app hosts, so every tool call crosses this gate with
+            # Accept: application/json and a Bearer token that keeps its stale
+            # email for the token's whole lifetime. Tell it to re-auth instead.
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "email_refresh_required",
+                    "detail": (
+                        "Your email has been verified since this token was "
+                        "issued. Re-authenticate to obtain a token carrying "
+                        "your verified address."
+                    ),
+                },
+            )
         uri = request.headers.get("x-forwarded-uri", "/")
         rd = quote(f"{proto}://{host}{uri}", safe="")
+        # No prompt=none: oauth2-proxy's /oauth2/sign_in does not forward query
+        # parameters to the IdP authorize URL, so it was inert and merely implied
+        # a silent refresh this is not. With SKIP_PROVIDER_BUTTON it goes
+        # straight to doOAuthStart and keeps only `rd`. The round-trip through
+        # Cognito is real; it is invisible in practice only because the IdP
+        # session is still live.
         return RedirectResponse(
-            url=f"{proto}://{host}/oauth2/sign_in?prompt=none&rd={rd}",
+            url=f"{proto}://{host}/oauth2/sign_in?rd={rd}",
             status_code=302,
         )
 
@@ -364,6 +422,12 @@ async def verify_email(token: str, request: Request):
             url=f"{portal}?verify_error=expired_or_invalid",
             status_code=302,
         )
+
+    # Drop this sid from the gate's memo so the very next request re-reads the
+    # database. Otherwise the user who just clicked the link is still cached as
+    # unverified for up to the TTL and gets bounced back to the collection page
+    # with nothing rendered to explain why.
+    gate_evict(sid)
 
     return RedirectResponse(url=f"{portal}?verified=1", status_code=302)
 

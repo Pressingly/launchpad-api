@@ -1,4 +1,5 @@
 """Configuration loaded from environment variables."""
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -59,8 +60,21 @@ class Settings(BaseSettings):
     verification_link_expiry_hours: int = 24
 
     # Verify-gate (ADR-0018)
-    synthetic_email_domain: str = "askii.ai"
+    # Compared verbatim against the address mpass-auth-proxy builds, so it must
+    # be the same string. mpass .strip()s its copy; mirror that below or a
+    # trailing space in DEFAULT_EMAIL_DOMAIN silently breaks REFRESH detection.
+    synthetic_email_domain: str = ""
     gate_cache_ttl_seconds: int = 10
+
+    @field_validator("synthetic_email_domain", mode="before")
+    @classmethod
+    def _strip_synthetic_domain(cls, v):
+        """Mirror mpass-auth-proxy, which .strip()s its copy of this value.
+
+        The gate compares the email claim verbatim against f"{sid}@{domain}", so
+        a trailing space here and not there means REFRESH never matches and a
+        verified user is waved through still carrying the synthetic address."""
+        return v.strip() if isinstance(v, str) else v
 
     class Config:
         env_file = ".env"
@@ -76,3 +90,4 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
