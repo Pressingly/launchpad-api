@@ -8,20 +8,35 @@ import pytest
 from src import db, gate
 
 
-@pytest.fixture
-async def cleanup_test_users():
-    yield
-    pool = await db.get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM foss_users WHERE synthetic_id LIKE 'test_%'")
-        await conn.execute("DELETE FROM foss_users_audit WHERE synthetic_id LIKE 'test_%'")
+# No local cleanup_test_users fixture: conftest provides one that deletes
+# foss_users through the ordinary pool and foss_users_audit over the superuser
+# connection. The audit table deliberately does not grant DELETE to
+# launchpad_api_user (it is an append-only action history), so a local fixture
+# using the app pool fails with InsufficientPrivilegeError at teardown.
 
 
 async def _mk_verified(sid: str, email: str):
+    """Seed a verified user.
+
+    Tokens are stored hashed, so both calls take a digest rather than the raw
+    value; db.hash_token is the same function the endpoints use.
+    """
     from datetime import datetime
+
     expires = datetime.now(timezone.utc) + timedelta(hours=24)
-    await db.insert_user(sid, email, "Jane", "tok_" + sid, expires)
-    await db.mark_verified("tok_" + sid)
+    token_hash = db.hash_token("tok_" + sid)
+    await db.submit_email(
+        synthetic_id=sid,
+        email=email,
+        display_name="Jane",
+        token_hash=token_hash,
+        verification_expires=expires,
+        consent_text_version="test",
+        consent_text_content="test consent",
+        ip_address=None,
+        user_agent=None,
+    )
+    await db.mark_verified(token_hash, ip_address=None, user_agent=None)
 
 
 async def test_authz_allows_verified_real_email(client, cleanup_test_users):

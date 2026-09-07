@@ -6,6 +6,5 @@ pydantic==2.9.0
 pydantic-settings==2.5.0
 email-validator==2.2.0
 jinja2==3.1.4
-httpx==0.27.2
-pytest==8.3.3
-pytest-asyncio==0.24.0
+# Same pin as mpass-auth-proxy, so the two services do not diverge.
+redis[hiredis]==5.2.1

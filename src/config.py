@@ -8,7 +8,12 @@ class Settings(BaseSettings):
     db_port: int = 5432
     db_name: str = "launchpad"
     db_user: str = "launchpad_api_user"
-    db_password: str
+    # No required-value default. Compose cannot make a required-variable guard
+    # conditional (it interpolates every service regardless of profiles), so
+    # DB_PASSWORD arrives as an empty string when the feature is off. Validating
+    # at import instead would make the module unimportable without a database
+    # password, which blocks any test job that does not need one.
+    db_password: str = ""
 
     # SMTP
     smtp_host: str = "mailpit"
@@ -18,6 +23,35 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = False
     from_address: str = "noreply@askii.ai"
     from_name: str = "FOSS Launchpad"
+
+    # Valkey/Redis, backing store for the rate limiter (src/rate_limit.py).
+    # Database 11: 2, 5, 6, 7, 8, 9, 10, 12, 13 and 14 are claimed by other
+    # services in docker-compose.yml; 11 is free.
+    redis_url: str = "redis://valkey:6379/11"
+
+    # Resend is 3/day rather than a rounder number because after the
+    # squatting fix it is one of only two things bounding how often an
+    # address the caller does not own can be mailed. The other is that
+    # /api/email charges a repeat submission of the address the caller
+    # already holds to this same resend bucket, rather than to the far
+    # larger submit allowance. Raising either raises the harassment
+    # budget, so treat both as load-bearing rather than hygiene.
+    #
+    # The residual: routing only catches *consecutive* submissions of the
+    # same address. Alternating between two addresses burns both buckets
+    # rather than staying on the larger one -- measured at 4 sends in 6
+    # attempts -- so per-account outbound stays capped, but per-victim it
+    # is looser than the same-address case. Accepted: the caller is
+    # authenticated and the total is bounded. Tightening it would mean
+    # per-(account, address) counters.
+    rate_limit_submit_per_hour: int = 3
+    rate_limit_submit_per_day: int = 10
+    rate_limit_resend_per_minute: int = 1
+    rate_limit_resend_per_day: int = 3
+    # Platform-wide daily ceiling: bounds damage from a compromised account and
+    # protects the shared SMTP quota that Plane invites and Outline
+    # notifications also draw on.
+    rate_limit_global_per_day: int = 500
 
     # Launchpad-specific
     platform_protocol: str = "https"
