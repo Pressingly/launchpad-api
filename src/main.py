@@ -236,11 +236,22 @@ async def authz(
         if not wants_html:
             # Do NOT wave a stale programmatic caller through. This previously
             # returned 200, which handed the app the synthetic address and let
-            # it create exactly the row this gate exists to prevent. MCP traffic
-            # is not a side channel: PLANE_BASE_URL and OUTLINE_API_URL point at
-            # the public app hosts, so every tool call crosses this gate with
-            # Accept: application/json and a Bearer token that keeps its stale
-            # email for the token's whole lifetime. Tell it to re-auth instead.
+            # it create exactly the row this gate exists to prevent. The
+            # standalone MCP servers are not a side channel: PLANE_BASE_URL and
+            # OUTLINE_API_URL point at the public app hosts, so those tool calls
+            # cross this gate with Accept: application/json and a Bearer token
+            # that keeps its stale email for the token's whole lifetime. Tell
+            # them to re-auth instead.
+            #
+            # Known carve-out, NOT covered here: `twenty-mcp-bypass`
+            # (docker-compose.yml) matches /mcp, /oauth/ and /.well-known/oauth
+            # at priority 20, ahead of twenty-secure, with no mpass-auth in its
+            # chain -- so no identity header reaches it and there is nothing for
+            # this gate to decide on. That is Twenty's own MCP OAuth, which must
+            # stay reachable unauthenticated for discovery and token exchange;
+            # gating it would break the flow rather than protect it. Whether
+            # that path can mint a Twenty user outside the gate is tracked
+            # separately -- do not read this endpoint as blanket MCP coverage.
             return JSONResponse(
                 status_code=403,
                 content={

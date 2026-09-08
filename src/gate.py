@@ -37,6 +37,12 @@ class _CacheEntry:
     expires_at: float
 
 
+# Bounded on purpose. Entries are added on every miss and removed only by
+# evict() on verification, so an unverified population -- exactly the users the
+# gate keeps bouncing -- would otherwise accumulate one entry each for the life
+# of the container. Sweeping expired entries on insert keeps it proportional to
+# active users rather than to every sid ever seen.
+_CACHE_MAX_ENTRIES = 10_000
 _cache: dict[str, _CacheEntry] = {}
 
 
@@ -55,6 +61,15 @@ async def verified_state(
     user = await db.fetch_user(sid)
     verified = bool(user and user["verified"])
     email = user["real_email"] if user else None
+
+    if len(_cache) >= _CACHE_MAX_ENTRIES:
+        for k in [k for k, v in _cache.items() if v.expires_at <= t]:
+            del _cache[k]
+        if len(_cache) >= _CACHE_MAX_ENTRIES:
+            # Everything is live: drop the entry closest to expiry rather than
+            # grow without bound. Losing a memo costs one database read.
+            del _cache[min(_cache, key=lambda k: _cache[k].expires_at)]
+
     _cache[sid] = _CacheEntry(verified=verified, email=email, expires_at=t + ttl_seconds)
     return verified, email
 
