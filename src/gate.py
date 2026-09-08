@@ -69,12 +69,19 @@ async def verified_state(
     if len(_cache) >= _CACHE_MAX_ENTRIES:
         for k in [k for k, v in _cache.items() if v.expires_at <= t]:
             del _cache[k]
-        for k in [k for k, ts in _tombstones.items() if ts <= t]:
-            del _tombstones[k]
         if len(_cache) >= _CACHE_MAX_ENTRIES:
             # Everything is live: drop the entry closest to expiry rather than
             # grow without bound. Losing a memo costs one database read.
             del _cache[min(_cache, key=lambda k: _cache[k].expires_at)]
+
+    # Sweep tombstones on every write, not inside the cache-size branch. With a
+    # 10s TTL the cache only ever holds sids seen in the last 10 seconds, so it
+    # never reaches _CACHE_MAX_ENTRIES and a sweep nested under that branch would
+    # never run -- leaving one dead float per verification for the life of the
+    # container. Older than a full TTL means no in-flight lookup can still need
+    # it; `<= t` would discard the tombstone this very call may be racing.
+    for k in [k for k, ts in _tombstones.items() if ts < t - ttl_seconds]:
+        del _tombstones[k]
 
     _cache[sid] = _CacheEntry(verified=verified, email=email, expires_at=t + ttl_seconds)
     return verified, email
@@ -89,7 +96,7 @@ async def verified_state(
 _tombstones: dict[str, float] = {}
 
 
-def evict(sid: str) -> None:
+def evict(sid: str, now: Optional[float] = None) -> None:
     """Forget one sid, so the next request re-reads the database.
 
     Called from /api/verify. Without it a user who clicks their verification
@@ -97,7 +104,12 @@ def evict(sid: str) -> None:
     the TTL, so the gate bounces them back to /?collect=1 -- where /api/me now
     reports verified, so no modal renders and they see an unexplained bounce."""
     _cache.pop(sid, None)
-    _tombstones[sid] = time.monotonic()
+    # Same clock base verified_state compares against. `now` is an injectable
+    # seam there (the TTL tests pass 100.0), so writing time.monotonic() here
+    # unconditionally would leave a tombstone ~8e5 against a test clock of 100
+    # -- permanently newer, so every later lookup would early-return and the sid
+    # would never be memoized again.
+    _tombstones[sid] = time.monotonic() if now is None else now
 
 
 def _clear_cache() -> None:
