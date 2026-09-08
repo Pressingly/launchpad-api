@@ -5,11 +5,14 @@ import secrets as _secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import quote
 
-from fastapi import FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import RedirectResponse, Response
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from src import consent_text, db, rate_limit
+from src.gate import GateAction, decide_gate, verified_state
+from src.gate import evict as gate_evict
 from src.config import settings
 from src.models import EmailSubmitRequest, UserStateResponse
 
@@ -162,6 +165,130 @@ async def get_me(x_auth_request_preferred_username: str = Header(default="")):
     )
 
 
+@app.get("/api/authz")
+async def authz(
+    request: Request,
+    x_auth_request_preferred_username: str = Header(default=""),
+    x_auth_request_email: str = Header(default=""),
+):
+    """Edge verify-gate (ADR-0018). Traefik ForwardAuth calls this after the
+    mpass-auth login check on every *application* router. It never runs for the
+    portal or /api/* routers, so an unverified user can always reach the
+    collection flow."""
+    sid = x_auth_request_preferred_username
+    if not sid:
+        # mpass-auth runs before this gate, so identity is always present in a
+        # correct config. Its absence means a wiring mistake — fail closed.
+        raise HTTPException(status_code=401, detail="missing identity")
+
+    if not settings.synthetic_email_domain:
+        # Without it, decide_gate compares against f"{sid}@" -- a string no real
+        # address matches -- so REFRESH never fires and a verified user holding a
+        # stale token is waved through carrying the synthetic address. That is
+        # the duplicate this gate exists to prevent, so refuse rather than run
+        # half-blind. mpass-auth-proxy dies at startup on the same missing value.
+        logger.error(
+            "authz: SYNTHETIC_EMAIL_DOMAIN is empty; refusing to gate. Set "
+            "DEFAULT_EMAIL_DOMAIN in .env -- it must match mpass-auth-proxy's."
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "gate_misconfigured",
+                "detail": "SYNTHETIC_EMAIL_DOMAIN is not configured.",
+            },
+        )
+
+    try:
+        verified, _ = await verified_state(sid, settings.gate_cache_ttl_seconds)
+    except Exception as exc:
+        # Fail closed, but deliberately and visibly. Unhandled, this became a
+        # FastAPI 500 that Traefik copied to the client, so a launchpad DB blip
+        # 500'd every gated app for every user -- including already-verified
+        # ones -- with nothing but a traceback to diagnose it. The gate runs on
+        # far more requests than /token does, so this path is hot.
+        logger.error(
+            "authz: verified-state lookup failed for sid=%s: %s: %s",
+            sid, type(exc).__name__, exc,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "verification_service_unavailable",
+                "detail": "Email verification service is temporarily unavailable.",
+            },
+        )
+    action = decide_gate(
+        verified=verified,
+        email=x_auth_request_email,
+        sid=sid,
+        synthetic_domain=settings.synthetic_email_domain,
+    )
+    wants_html = "text/html" in request.headers.get("accept", "")
+
+    if action is GateAction.ALLOW:
+        return Response(status_code=200)
+
+    proto = request.headers.get("x-forwarded-proto", settings.platform_protocol)
+    host = request.headers.get("x-forwarded-host", settings.platform_domain)
+
+    if action is GateAction.REFRESH:
+        if not wants_html:
+            # Do NOT wave a stale programmatic caller through. This previously
+            # returned 200, which handed the app the synthetic address and let
+            # it create exactly the row this gate exists to prevent. The
+            # standalone MCP servers are not a side channel: PLANE_BASE_URL and
+            # OUTLINE_API_URL point at the public app hosts, so those tool calls
+            # cross this gate with Accept: application/json and a Bearer token
+            # that keeps its stale email for the token's whole lifetime. Tell
+            # them to re-auth instead.
+            #
+            # Known carve-out, NOT covered here: `twenty-mcp-bypass`
+            # (docker-compose.yml) matches /mcp, /oauth/, /.well-known/oauth and
+            # /authorize -- the last being an SPA route with no server handler,
+            # which redirects an unauthenticated visitor back into the gated
+            # /auth/sso/proxy-login path
+            # at priority 20, ahead of twenty-secure, with no mpass-auth in its
+            # chain -- so no identity header reaches it and there is nothing for
+            # this gate to decide on. That is Twenty's own MCP OAuth, which must
+            # stay reachable unauthenticated for discovery and token exchange;
+            # gating it would break the flow rather than protect it. Whether
+            # that path can mint a Twenty user outside the gate is tracked
+            # separately -- do not read this endpoint as blanket MCP coverage.
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "email_refresh_required",
+                    "detail": (
+                        "Your email has been verified since this token was "
+                        "issued. Re-authenticate to obtain a token carrying "
+                        "your verified address."
+                    ),
+                },
+            )
+        uri = request.headers.get("x-forwarded-uri", "/")
+        rd = quote(f"{proto}://{host}{uri}", safe="")
+        # No prompt=none: oauth2-proxy's /oauth2/sign_in does not forward query
+        # parameters to the IdP authorize URL, so it was inert and merely implied
+        # a silent refresh this is not. With SKIP_PROVIDER_BUTTON it goes
+        # straight to doOAuthStart and keeps only `rd`. The round-trip through
+        # Cognito is real; it is invisible in practice only because the IdP
+        # session is still live.
+        return RedirectResponse(
+            url=f"{proto}://{host}/oauth2/sign_in?rd={rd}",
+            status_code=302,
+        )
+
+    # action is GateAction.COLLECT
+    portal = f"{settings.platform_protocol}://{settings.platform_domain}/?collect=1"
+    if wants_html:
+        return RedirectResponse(url=portal, status_code=302)
+    return JSONResponse(
+        status_code=403,
+        content={"error": "email_verification_required", "verify_url": portal},
+    )
+
+
 @app.post("/api/email", status_code=202)
 async def submit_email(
     payload: EmailSubmitRequest,
@@ -310,6 +437,12 @@ async def verify_email(token: str, request: Request):
             status_code=302,
         )
 
+    # Drop this sid from the gate's memo so the very next request re-reads the
+    # database. Otherwise the user who just clicked the link is still cached as
+    # unverified for up to the TTL and gets bounced back to the collection page
+    # with nothing rendered to explain why.
+    gate_evict(sid)
+
     return RedirectResponse(url=f"{portal}?verified=1", status_code=302)
 
 
@@ -365,18 +498,13 @@ async def resend_verification(request: Request, x_auth_request_preferred_usernam
     return {"status": "ok"}
 
 
-@app.post("/api/dismiss", status_code=204)
-async def dismiss(request: Request, x_auth_request_preferred_username: str = Header(default="")):
-    sid = extract_synthetic_id(x_auth_request_preferred_username)
-
-    await db.insert_audit(
-        synthetic_id=sid,
-        action="dismiss_modal",
-        email=None,
-        consent_text_version=None,
-        consent_text_content=None,
-        ip_address=_client_ip(request),
-        user_agent=request.headers.get("user-agent"),
+@app.post("/api/dismiss", status_code=410)
+async def dismiss():
+    """Retired. Providing a verified email is now mandatory and enforced at the
+    edge by the verify-gate (ADR-0018), so there is no "dismiss" anymore. Kept
+    as an explicit 410 (not deleted) so a cached frontend still calling it gets
+    a clear, intentional signal rather than a 404 that reads as a routing bug."""
+    raise HTTPException(
+        status_code=410,
+        detail="dismiss is retired; a verified email is mandatory",
     )
-
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
