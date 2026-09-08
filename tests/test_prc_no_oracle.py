@@ -7,7 +7,12 @@ of* the usual `submit_email` row.
 """
 import re
 
-from tests.conftest import audit_actions, new_email, new_sid, seed_pending, submit
+from tests.conftest import audit_actions, new_email, new_sid, seed_relinked, submit
+
+# "Already verified by another account" now means relink-complete: clicking the
+# verification link leaves a user in pending_relink with verified still FALSE,
+# and the partial unique index -- which is what makes an address exclusive --
+# only covers verified rows. seed_relinked takes the victim all the way there.
 
 # The 202 body carries a timestamp, so "byte-identical" (§6.1) can only mean
 # identical once that timestamp is normalised — two responses are microseconds
@@ -23,9 +28,7 @@ async def test_collision_submit_returns_ordinary_202_body(raw_client, cleanup_te
     email = new_email("oracle")
     victim, attacker, control = new_sid(), new_sid(), new_sid()
 
-    await seed_pending(victim, email, "tok-victim")
-    verified = await raw_client.get("/api/verify?token=tok-victim", follow_redirects=False)
-    assert "verified=1" in verified.headers.get("location", "")
+    await seed_relinked(victim, email)
 
     collision = await submit(raw_client, attacker, email)
     ordinary = await submit(raw_client, control, new_email("ordinary"))
@@ -43,8 +46,7 @@ async def test_collision_writes_submit_email_collision_audit_row(
     email = new_email("oracle")
     victim, attacker = new_sid(), new_sid()
 
-    await seed_pending(victim, email, "tok-victim2")
-    await raw_client.get("/api/verify?token=tok-victim2", follow_redirects=False)
+    await seed_relinked(victim, email)
 
     assert (await submit(raw_client, attacker, email)).status_code == 202
     assert "submit_email_collision" in await audit_actions(attacker)
@@ -57,8 +59,7 @@ async def test_collision_does_not_write_a_submit_email_audit_row(
     email = new_email("oracle")
     victim, attacker = new_sid(), new_sid()
 
-    await seed_pending(victim, email, "tok-victim3")
-    await raw_client.get("/api/verify?token=tok-victim3", follow_redirects=False)
+    await seed_relinked(victim, email)
 
     assert (await submit(raw_client, attacker, email)).status_code == 202
     assert "submit_email" not in await audit_actions(attacker)
@@ -71,8 +72,7 @@ async def test_collision_audit_row_keeps_consent_text_for_forensics(
 
     email = new_email("oracle")
     victim, attacker = new_sid(), new_sid()
-    await seed_pending(victim, email, "tok-victim4")
-    await raw_client.get("/api/verify?token=tok-victim4", follow_redirects=False)
+    await seed_relinked(victim, email)
     await submit(raw_client, attacker, email)
 
     pool = await db.get_pool()

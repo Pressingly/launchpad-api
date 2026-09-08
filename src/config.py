@@ -66,6 +66,39 @@ class Settings(BaseSettings):
     synthetic_email_domain: str = ""
     gate_cache_ttl_seconds: int = 10
 
+    # Which relink mechanism is deployed: "" (none), "manual" or "runner". The
+    # ops override CLI (src/ops_override.py) branches on it and refuses when it
+    # is empty -- completing a relink that has not happened is what creates the
+    # duplicate app accounts the whole state machine exists to prevent.
+    #
+    # Named for the environment variable rather than for the concept, and that
+    # matters: env_prefix is "" (see Config below), so a field called
+    # `relink_runner` would bind RELINK_RUNNER while docker-compose.yml sets
+    # LAUNCHPAD_RELINK_RUNNER on the service. It would read empty in the
+    # container and the override would refuse every invocation -- which is
+    # indistinguishable from the override refusing correctly, so it would be
+    # diagnosed as policy rather than as a typo. tests/test_ops_override.py
+    # asserts the binding itself for exactly that reason.
+    #
+    # This is the copy the CONTAINER reads. docker-compose.yml renders the value
+    # twice; platform.sh reads the OTHER copy (the top-level
+    # x-launchpad-relink-runner extension field) because `docker compose config`
+    # omits profiled services. The override runs inside this container, so this
+    # is the right source for it.
+    launchpad_relink_runner: str = ""
+
+    @field_validator("launchpad_relink_runner", mode="before")
+    @classmethod
+    def _strip_relink_runner(cls, v):
+        """Trim only. The value is matched exactly and case-sensitively after
+        this, matching platform.sh's `_validate_launchpad_switch` -- which reads
+        the rendered compose config through `_rendered_value`, and that helper
+        strips surrounding quotes and whitespace. Anything looser here (a
+        .lower(), an alias for "Manual") would make the two disagree about which
+        configurations are valid, and the whole point of the variable is that
+        both sides read it the same way."""
+        return v.strip() if isinstance(v, str) else v
+
     @field_validator("synthetic_email_domain", mode="before")
     @classmethod
     def _strip_synthetic_domain(cls, v):

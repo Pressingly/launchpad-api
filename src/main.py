@@ -144,6 +144,22 @@ async def get_me(x_auth_request_preferred_username: str = Header(default="")):
     if user is None:
         return UserStateResponse(state="not_collected")
 
+    # The relinking branch comes first because pending_relink means HELD,
+    # regardless of `verified`. An earlier version of this comment said a
+    # pending_relink user is never verified -- that stopped being true in this
+    # same PR: ops_override_write's ON CONFLICT preserves verified while
+    # setting pending_relink, so an interrupted manual override leaves
+    # (TRUE, 'pending_relink') durably. Ordering on "held" rather than on
+    # "not verified" is what makes this correct for that state, and keeps
+    # /api/me agreeing with /api/authz, which orders the same way.
+    if user["relink_state"] == "pending_relink":
+        return UserStateResponse(
+            state="relinking",
+            # Included so the panel can name the address being set up.
+            email=user["real_email"],
+            display_name=user["display_name"],
+        )
+
     if user["verified"]:
         return UserStateResponse(
             state="verified",
@@ -200,7 +216,9 @@ async def authz(
         )
 
     try:
-        verified, _ = await verified_state(sid, settings.gate_cache_ttl_seconds)
+        verified, _, relink_state = await verified_state(
+            sid, settings.gate_cache_ttl_seconds
+        )
     except Exception as exc:
         # Fail closed, but deliberately and visibly. Unhandled, this became a
         # FastAPI 500 that Traefik copied to the client, so a launchpad DB blip
@@ -220,6 +238,7 @@ async def authz(
         )
     action = decide_gate(
         verified=verified,
+        relink_state=relink_state,
         email=x_auth_request_email,
         sid=sid,
         synthetic_domain=settings.synthetic_email_domain,
@@ -277,6 +296,27 @@ async def authz(
         return RedirectResponse(
             url=f"{proto}://{host}/oauth2/sign_in?rd={rd}",
             status_code=302,
+        )
+
+    if action is GateAction.RELINKING:
+        # Routed like COLLECT -- 302 for a browser, 403 for an API client -- but
+        # with its own reason and its own portal flag. Same shape, different
+        # explanation: this user has already given us an address and clicked the
+        # link, so showing them the collection form again invites a resubmit
+        # that lands them right back here, with nothing saying why.
+        #
+        # They must NOT be let through. A pending_relink user is precisely the
+        # population for whom an app visit creates the duplicate account: their
+        # existing app accounts are still keyed to the synthetic address and
+        # have not been moved yet.
+        relinking_portal = (
+            f"{settings.platform_protocol}://{settings.platform_domain}/?relinking=1"
+        )
+        if wants_html:
+            return RedirectResponse(url=relinking_portal, status_code=302)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "relink_in_progress", "verify_url": relinking_portal},
         )
 
     # action is GateAction.COLLECT
@@ -411,13 +451,22 @@ async def submit_email(
 async def verify_email(token: str, request: Request):
     # NOTE: this GET is state-mutating (consumes the one-use token). Enterprise
     # mail scanners / link-prefetchers can therefore "click" the link before the
-    # user does and mark them verified early. That outcome is benign here (the
-    # user still ends up verified), but if this endpoint ever gains
-    # side-effects beyond verification, gate it behind an interstitial POST.
+    # user does. The outcome is still benign, but no longer for the reason this
+    # comment used to give: a prefetch no longer leaves them verified, it leaves
+    # them in pending_relink, i.e. HELD by the gate until a relink completes.
+    # Benign because they were going to be held anyway and the address is not
+    # live until the relink runs -- not because they "end up verified". If this
+    # endpoint ever gains side-effects beyond that, gate it behind an
+    # interstitial POST.
     portal = f"{settings.platform_protocol}://{settings.platform_domain}/"
 
     try:
-        sid = await db.mark_verified(
+        # NOT mark_verified -- that function is gone. Clicking the link proves
+        # the user controls the address; it does not move their five app
+        # accounts onto it. Setting verified here is what made every app create
+        # a second account, so the click now only moves them to pending_relink
+        # and the relink sets verified.
+        sid = await db.mark_pending_relink(
             token_hash=db.hash_token(token),
             ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
@@ -438,12 +487,19 @@ async def verify_email(token: str, request: Request):
         )
 
     # Drop this sid from the gate's memo so the very next request re-reads the
-    # database. Otherwise the user who just clicked the link is still cached as
-    # unverified for up to the TTL and gets bounced back to the collection page
-    # with nothing rendered to explain why.
+    # database. Otherwise the user who just clicked the link is still cached in
+    # their previous state for up to the TTL and gets bounced somewhere that
+    # renders nothing to explain why.
     gate_evict(sid)
 
-    return RedirectResponse(url=f"{portal}?verified=1", status_code=302)
+    # ?relinking=1, not ?verified=1. The portal treats ?verified=1 as "your
+    # address is live now" and fires a full /oauth2/sign_in round-trip to remint
+    # the session so the apps see the new claim. After this change the claim has
+    # NOT changed -- the overlay still returns the synthetic address until the
+    # relink sets verified -- so that round-trip would buy nothing and land the
+    # user back on the portal a redirect later. ?relinking=1 renders the panel
+    # that says what is actually happening.
+    return RedirectResponse(url=f"{portal}?relinking=1", status_code=302)
 
 
 @app.post("/api/email/resend")

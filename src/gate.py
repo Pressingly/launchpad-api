@@ -11,19 +11,51 @@ from src import db
 
 
 class GateAction(str, Enum):
-    ALLOW = "allow"        # verified + token carries a real email → let the app through
-    REFRESH = "refresh"    # verified in DB, but the token still carries <sid>@domain → refresh
-    COLLECT = "collect"    # no verified email yet → send to the collection modal
+    ALLOW = "allow"        # relink complete + token carries a real email → let the app through
+    REFRESH = "refresh"    # relink complete, but the token still carries <sid>@domain → refresh
+    COLLECT = "collect"    # no email submitted / not verified yet → collection modal
+    RELINKING = "relinking"  # verification clicked, relink not done → hold
 
 
-def decide_gate(*, verified: bool, email: str, sid: str, synthetic_domain: str) -> GateAction:
+def is_relink_complete(*, verified: bool, relink_state: str) -> bool:
+    """True when the user's app accounts are (or need not be) relinked.
+
+    One helper, because there are two ways to be complete and scattering the
+    second one is how it gets missed:
+
+    - `relink_state == 'relinked'` — the ordinary path.
+    - `verified` with `relink_state == 'none'` — the LEGACY combination, a user
+      who verified before this column existed. There are none in production
+      (capture has never been enabled anywhere), but a devstack or test database
+      has them, and holding them would lock out test accounts the moment the
+      feature was enabled after a test run.
+
+    Deliberately stricter than "relinked OR legacy": `verified` is required in
+    both branches. mark_relinked sets both columns in one statement so
+    (verified = FALSE, relink_state = 'relinked') is unreachable through the
+    code, but if a hand-edited row ever produced it, treating it as complete
+    would ALLOW a user whose overlay still serves the synthetic address -- the
+    §1 invariant failing one layer above the query that enforces it.
+    """
+    return verified and relink_state in ("relinked", "none")
+
+
+def decide_gate(
+    *, verified: bool, relink_state: str, email: str, sid: str, synthetic_domain: str
+) -> GateAction:
     """Decide what the edge should do for one request.
 
     `email` is the value oauth2-proxy forwarded as X-Auth-Request-Email. An
     unverified user carries exactly `<sid>@<synthetic_domain>` (ADR-0004); we
     match that string exactly rather than a bare `@<domain>` suffix, because
-    `<domain>` (askii.ai) is also a real Moneta email domain."""
-    if not verified:
+    `<domain>` (askii.ai) is also a real Moneta email domain.
+
+    pending_relink is checked first and never falls through: that population is
+    the one for whom an app visit creates the duplicate account, because their
+    relink has not happened yet."""
+    if relink_state == "pending_relink":
+        return GateAction.RELINKING
+    if not is_relink_complete(verified=verified, relink_state=relink_state):
         return GateAction.COLLECT
     if email == f"{sid}@{synthetic_domain}":
         return GateAction.REFRESH
@@ -34,6 +66,7 @@ def decide_gate(*, verified: bool, email: str, sid: str, synthetic_domain: str) 
 class _CacheEntry:
     verified: bool
     email: Optional[str]
+    relink_state: str
     expires_at: float
 
 
@@ -48,22 +81,27 @@ _cache: dict[str, _CacheEntry] = {}
 
 async def verified_state(
     sid: str, ttl_seconds: int, now: Optional[float] = None
-) -> tuple[bool, Optional[str]]:
-    """Return (verified, real_email) for a synthetic id, memoized for
-    `ttl_seconds`. The edge calls this on every request, so a short cache keeps
-    the auth path off the database for the common case. `now` is injectable so
-    the TTL is testable without wall-clock flakiness."""
+) -> tuple[bool, Optional[str], str]:
+    """Return (verified, real_email, relink_state) for a synthetic id, memoized
+    for `ttl_seconds`. The edge calls this on every request, so a short cache
+    keeps the auth path off the database for the common case. `now` is
+    injectable so the TTL is testable without wall-clock flakiness.
+
+    A row that has never been submitted reports relink_state 'none', which with
+    verified False is the "collect" combination -- the same answer the missing
+    row itself means."""
     t = time.monotonic() if now is None else now
     entry = _cache.get(sid)
     if entry is not None and entry.expires_at > t:
-        return entry.verified, entry.email
+        return entry.verified, entry.email, entry.relink_state
 
     user = await db.fetch_user(sid)
     verified = bool(user and user["verified"])
+    relink_state = (user or {}).get("relink_state") or "none"
 
     if _tombstones.get(sid, -1.0) >= t:
         # Evicted while this lookup was in flight; the answer is already stale.
-        return verified, user["real_email"] if user else None
+        return verified, (user["real_email"] if user else None), relink_state
     email = user["real_email"] if user else None
 
     if len(_cache) >= _CACHE_MAX_ENTRIES:
@@ -83,8 +121,13 @@ async def verified_state(
     for k in [k for k, ts in _tombstones.items() if ts < t - ttl_seconds]:
         del _tombstones[k]
 
-    _cache[sid] = _CacheEntry(verified=verified, email=email, expires_at=t + ttl_seconds)
-    return verified, email
+    _cache[sid] = _CacheEntry(
+        verified=verified,
+        email=email,
+        relink_state=relink_state,
+        expires_at=t + ttl_seconds,
+    )
+    return verified, email, relink_state
 
 
 # Set by evict(). verified_state captures the clock before its await and skips
@@ -99,10 +142,13 @@ _tombstones: dict[str, float] = {}
 def evict(sid: str, now: Optional[float] = None) -> None:
     """Forget one sid, so the next request re-reads the database.
 
-    Called from /api/verify. Without it a user who clicks their verification
-    link and immediately opens an app is still cached as unverified for up to
-    the TTL, so the gate bounces them back to /?collect=1 -- where /api/me now
-    reports verified, so no modal renders and they see an unexplained bounce."""
+    Called from /api/verify, and required from every other transition too: the
+    memo now holds relink_state as well, so a completed relink that does not
+    evict leaves the user held at RELINKING for up to the TTL after they are
+    entitled to go through. Without it a user who clicks their verification link
+    and immediately opens an app is still cached in their previous state for up
+    to the TTL, so the gate bounces them somewhere that renders nothing to
+    explain why."""
     _cache.pop(sid, None)
     # Same clock base verified_state compares against. `now` is an injectable
     # seam there (the TTL tests pass 100.0), so writing time.monotonic() here

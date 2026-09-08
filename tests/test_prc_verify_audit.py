@@ -12,7 +12,7 @@ async def test_verify_writes_a_verify_email_audit_row(raw_client, cleanup_test_u
     await seed_pending(sid, new_email("vaudit"), "tok-audit")
 
     response = await raw_client.get("/api/verify?token=tok-audit", follow_redirects=False)
-    assert "verified=1" in response.headers["location"]
+    assert "relinking=1" in response.headers["location"]
 
     assert "verify_email" in await audit_actions(sid)
 

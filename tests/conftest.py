@@ -245,6 +245,39 @@ async def seed_pending(
         )
 
 
+async def seed_relinked(
+    sid: str,
+    email: str,
+    display_name: Optional[str] = None,
+) -> None:
+    """Seed a user whose relink is COMPLETE: verified TRUE, relink_state
+    'relinked'.
+
+    Most tests that used to say "verify this user" meant this. Clicking the
+    verification link no longer produces a verified user -- it produces a
+    pending_relink one -- so a test needing a user the gate lets through has to
+    go all the way to relinked. Routed through the real functions rather than a
+    hand-written UPDATE so it cannot drift from what the endpoints do.
+
+    One helper, not one per file: the same substitution is needed in six test
+    modules, and doing it per-file is how the definition of "complete" drifts.
+    """
+    raw = f"seed-relinked-{sid}"
+    await seed_pending(sid, email, raw, display_name=display_name)
+    assert await db.mark_pending_relink(sha256_hex(raw), None, None) == sid
+    assert await db.mark_relinked(sid) is True
+
+
+async def relink_state(sid: str) -> Optional[str]:
+    """The raw relink_state column for one sid, for assertions that must not go
+    through fetch_user's dict shaping."""
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT relink_state FROM foss_users WHERE synthetic_id = $1", sid
+        )
+
+
 async def audit_actions(sid: str) -> list:
     pool = await db.get_pool()
     async with pool.acquire() as conn:

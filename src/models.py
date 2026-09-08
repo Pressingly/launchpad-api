@@ -53,7 +53,10 @@ class EmailSubmitRequest(BaseModel):
 
 
 class UserStateResponse(BaseModel):
-    state: Literal["not_collected", "pending_verification", "verified"]
+    # "relinking" is the state between clicking the verification link and the
+    # app-account relink completing. The user is NOT verified yet -- verified is
+    # set only by the relink -- so the two are distinct values, not one flag.
+    state: Literal["not_collected", "pending_verification", "relinking", "verified"]
     email: Optional[str] = None
     display_name: Optional[str] = None
     verification_expires_at: Optional[datetime] = None

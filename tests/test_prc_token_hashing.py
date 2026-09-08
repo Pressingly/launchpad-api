@@ -43,8 +43,8 @@ async def test_verification_succeeds_with_the_raw_token_from_the_link(
     response = await client.get(f"/api/verify?token={raw}", follow_redirects=False)
 
     assert response.status_code == 302
-    assert "verified=1" in response.headers["location"]
-    assert (await db.fetch_user(sid))["verified"] is True
+    assert "relinking=1" in response.headers["location"]
+    assert (await db.fetch_user(sid))["relink_state"] == "pending_relink"
 
 
 async def test_stored_token_is_64_lowercase_hex_characters(
@@ -69,7 +69,9 @@ async def test_the_stored_digest_is_not_itself_a_usable_token(
     response = await client.get(f"/api/verify?token={stored}", follow_redirects=False)
 
     assert "verify_error=expired_or_invalid" in response.headers["location"]
-    assert (await db.fetch_user(sid))["verified"] is False
+    user = await db.fetch_user(sid)
+    assert user["verified"] is False
+    assert user["relink_state"] == "none"
 
 
 async def test_resend_also_stores_a_hash_not_the_emailed_value(

@@ -22,7 +22,8 @@ from src.db import (
     get_pool,
     hash_token,
     insert_audit,
-    mark_verified,
+    mark_pending_relink,
+    mark_relinked,
     rotate_verification_token,
     submit_email,
 )
@@ -52,6 +53,21 @@ async def _submit(sid: str, email: str, raw_token: str, expires=None, display_na
         ip_address="127.0.0.1",
         user_agent="pytest",
     )
+
+
+async def _relink(sid: str, raw_token: str) -> None:
+    """Take a submitted user all the way to relinked, the way the flow will:
+    the token click moves them to pending_relink, the relink completes them."""
+    assert await mark_pending_relink(hash_token(raw_token), None, None) == sid
+    assert await mark_relinked(sid) is True
+
+
+async def _state(sid: str) -> str:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT relink_state FROM foss_users WHERE synthetic_id = $1", sid
+        )
 
 
 async def test_pool_can_query():
@@ -95,7 +111,7 @@ async def test_submit_email_raises_already_verified_for_a_verified_caller(
 ):
     sid, email = _sid(), _email()
     await _submit(sid, email, "tok-verify")
-    assert await mark_verified(hash_token("tok-verify"), None, None) == sid
+    await _relink(sid, "tok-verify")
 
     with pytest.raises(AlreadyVerified):
         await _submit(sid, _email(), "tok-again")
@@ -123,7 +139,7 @@ async def test_submit_email_writes_a_collision_row_instead_of_a_consent_row(
     email = _email()
     victim, prober = _sid(), _sid()
     await _submit(victim, email, "tok-victim")
-    await mark_verified(hash_token("tok-victim"), None, None)
+    await _relink(victim, "tok-victim")
 
     await _submit(prober, email, "tok-prober")
 
@@ -142,21 +158,39 @@ async def test_fetch_user_not_found(cleanup_test_users):
     assert await fetch_user("test_nonexistent_xyz") is None
 
 
-async def test_mark_verified_with_valid_token(cleanup_test_users):
+async def test_mark_pending_relink_with_valid_token(cleanup_test_users):
     sid = _sid()
     await _submit(sid, _email(), "good_token")
 
-    assert await mark_verified(hash_token("good_token"), None, None) == sid
+    assert await mark_pending_relink(hash_token("good_token"), None, None) == sid
 
     user = await fetch_user(sid)
-    assert user["verified"] is True
     assert user["verification_token"] is None
+    assert user["relink_state"] == "pending_relink"
 
 
-async def test_mark_verified_writes_the_verify_email_audit_row(cleanup_test_users):
+async def test_mark_pending_relink_does_not_set_verified(cleanup_test_users):
+    """THE invariant. Consuming the token proves the user controls the address;
+    it does not move their app accounts onto it. The mpass overlay selects
+    WHERE verified = TRUE, so setting verified here is exactly what handed the
+    real address to five apps that each then created a second account."""
+    sid = _sid()
+    await _submit(sid, _email(), "inv_token")
+
+    await mark_pending_relink(hash_token("inv_token"), None, None)
+
+    user = await fetch_user(sid)
+    assert user["verified"] is False
+    assert user["verified_at"] is None
+    assert user["relink_state"] == "pending_relink"
+
+
+async def test_mark_pending_relink_writes_the_verify_email_audit_row(
+    cleanup_test_users,
+):
     sid = _sid()
     await _submit(sid, _email(), "audited_token")
-    await mark_verified(hash_token("audited_token"), "203.0.113.4", "pytest")
+    await mark_pending_relink(hash_token("audited_token"), "203.0.113.4", "pytest")
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -169,36 +203,162 @@ async def test_mark_verified_writes_the_verify_email_audit_row(cleanup_test_user
     assert str(row["ip_address"]) == "203.0.113.4"
 
 
-async def test_mark_verified_with_expired_token(cleanup_test_users):
+async def test_mark_pending_relink_with_expired_token(cleanup_test_users):
     sid = _sid()
     expired = datetime.now(timezone.utc) - timedelta(hours=1)
     await _submit(sid, _email(), "expired_token", expires=expired)
 
-    assert await mark_verified(hash_token("expired_token"), None, None) is None
+    assert await mark_pending_relink(hash_token("expired_token"), None, None) is None
+    assert await _state(sid) == "none"
 
 
-async def test_mark_verified_rejects_the_raw_token_lookalike(cleanup_test_users):
+async def test_mark_pending_relink_rejects_the_raw_token_lookalike(
+    cleanup_test_users,
+):
     """The column holds a digest, so passing the raw value finds nothing."""
     sid = _sid()
     await _submit(sid, _email(), "raw_token")
 
-    assert await mark_verified("raw_token", None, None) is None
+    assert await mark_pending_relink("raw_token", None, None) is None
     assert (await fetch_user(sid))["verified"] is False
+    assert await _state(sid) == "none"
 
 
-async def test_mark_verified_raises_when_another_account_owns_the_address(
+async def test_mark_pending_relink_raises_when_another_account_owns_the_address(
     cleanup_test_users,
 ):
+    """Still raised at click time even though the partial index can no longer
+    fire here -- verified is not set by this statement any more, so the check is
+    an explicit probe. Catching it early is better UX; it is no longer the
+    enforcement, which is why mark_relinked raises too."""
     email = _email()
     first, second = _sid(), _sid()
     await _submit(first, email, "tok-first")
     await _submit(second, email, "tok-second")
-    await mark_verified(hash_token("tok-first"), None, None)
+    await _relink(first, "tok-first")
 
     with pytest.raises(EmailAlreadyRegistered):
-        await mark_verified(hash_token("tok-second"), None, None)
+        await mark_pending_relink(hash_token("tok-second"), None, None)
 
     assert (await fetch_user(second))["verified"] is False
+    # The whole statement rolled back: the loser keeps their token rather than
+    # being left in 'none' with nothing to click.
+    assert await _state(second) == "none"
+    assert (await fetch_user(second))["verification_token"] == hash_token("tok-second")
+
+
+async def test_mark_relinked_sets_both_columns(cleanup_test_users):
+    """The ONLY path that sets verified, and it sets relink_state with it -- in
+    one statement, so the two cannot separate."""
+    sid = _sid()
+    await _submit(sid, _email(), "tok-relink")
+    assert await mark_pending_relink(hash_token("tok-relink"), None, None) == sid
+
+    assert await mark_relinked(sid) is True
+
+    user = await fetch_user(sid)
+    assert user["verified"] is True
+    assert user["verified_at"] is not None
+    assert user["relink_state"] == "relinked"
+
+
+async def test_relink_is_the_only_path_that_sets_verified(cleanup_test_users):
+    """Guards the split by construction: the old entry point is gone, not
+    aliased. A caller that sets verified without relinking is precisely the bug
+    the split exists to prevent, so its absence is asserted rather than
+    assumed."""
+    from src import db as db_module
+
+    assert not hasattr(db_module, "mark_" + "verified")
+
+    sid = _sid()
+    await _submit(sid, _email(), "tok-only")
+    await mark_pending_relink(hash_token("tok-only"), None, None)
+    assert (await fetch_user(sid))["verified"] is False
+
+    await mark_relinked(sid)
+    assert (await fetch_user(sid))["verified"] is True
+
+
+async def test_mark_relinked_is_idempotent(cleanup_test_users):
+    """An operator or a runner must be able to retry without knowing whether
+    the previous attempt got through."""
+    sid = _sid()
+    await _submit(sid, _email(), "tok-twice")
+    await mark_pending_relink(hash_token("tok-twice"), None, None)
+
+    assert await mark_relinked(sid) is True
+    first_verified_at = (await fetch_user(sid))["verified_at"]
+
+    assert await mark_relinked(sid) is True
+    assert (await fetch_user(sid))["verified_at"] == first_verified_at
+
+
+async def test_mark_relinked_returns_false_for_an_unknown_user(cleanup_test_users):
+    assert await mark_relinked("test_no_such_user_xyz") is False
+
+
+async def test_mark_relinked_raises_when_another_account_owns_the_address(
+    cleanup_test_users,
+):
+    """The unique-index conflict moved here with verified.
+
+    idx_foss_users_email is UNIQUE (lower(real_email)) WHERE verified, so this
+    UPDATE is now the statement it fires on. Uncaught it would be a 500 in
+    whatever runs the relink; the probe in mark_pending_relink is best-effort
+    and cannot be relied on, which is why this catch is the enforcement.
+    """
+    email = _email()
+    first, second = _sid(), _sid()
+    await _submit(first, email, "tok-w")
+    await _submit(second, email, "tok-l")
+    await _relink(first, "tok-w")
+
+    # Reach pending_relink without the probe: the loser is in this state
+    # whenever the winner relinks *after* they clicked their own link.
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET relink_state = 'pending_relink' "
+            "WHERE synthetic_id = $1",
+            second,
+        )
+
+    with pytest.raises(EmailAlreadyRegistered):
+        await mark_relinked(second)
+
+    assert (await fetch_user(second))["verified"] is False
+    assert await _state(second) == "pending_relink"
+
+
+async def test_mark_relinked_completes_a_legacy_verified_row(cleanup_test_users):
+    """verified = true with relink_state = 'none' is the legacy combination.
+    Completing it is a no-op in substance and must not fail."""
+    sid = _sid()
+    await _submit(sid, _email(), "tok-legacy")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET verified = TRUE, verified_at = now() "
+            "WHERE synthetic_id = $1",
+            sid,
+        )
+
+    assert await mark_relinked(sid) is True
+    assert await _state(sid) == "relinked"
+
+
+async def test_resubmitting_clears_a_pending_relink(cleanup_test_users):
+    """A fresh submission starts the flow over, so it must not leave the row
+    claiming a relink is in flight for an address that has just changed."""
+    sid = _sid()
+    await _submit(sid, _email(), "tok-a")
+    await mark_pending_relink(hash_token("tok-a"), None, None)
+    assert await _state(sid) == "pending_relink"
+
+    await _submit(sid, _email(), "tok-b")
+
+    assert await _state(sid) == "none"
 
 
 async def test_rotate_verification_token_returns_the_recipient(cleanup_test_users):
@@ -223,7 +383,7 @@ async def test_rotate_verification_token_raises_for_a_missing_row(cleanup_test_u
 async def test_rotate_verification_token_raises_for_a_verified_row(cleanup_test_users):
     sid = _sid()
     await _submit(sid, _email(), "tok-done")
-    await mark_verified(hash_token("tok-done"), None, None)
+    await _relink(sid, "tok-done")
 
     with pytest.raises(AlreadyVerified):
         await rotate_verification_token(
@@ -279,3 +439,38 @@ async def test_audit_table_is_append_only_for_the_api_role(cleanup_test_users):
             await conn.execute(
                 "DELETE FROM foss_users_audit WHERE synthetic_id = $1", sid
             )
+
+
+async def test_mark_relinked_refuses_a_user_who_never_verified(cleanup_test_users):
+    """The guard that stops mark_relinked being mark_verified in disguise.
+
+    A user who submits an address and never opens the mail sits at
+    ('none', verified=FALSE). Without the state guard, any caller handed that
+    sid -- a runner iterating the wrong predicate, an operator working from a
+    stale list -- would publish an unproven address to all five apps. The
+    partial index cannot help: nobody verified it, so there is nothing to
+    collide with.
+    """
+    sid = f"test_{secrets.token_hex(4)}"
+    await submit_email(
+        synthetic_id=sid, email="unproven@corp.example", display_name=None,
+        token_hash=hash_token("tok_" + sid),
+        verification_expires=datetime.now(timezone.utc) + timedelta(hours=24),
+        consent_text_version="t", consent_text_content="t",
+        ip_address=None, user_agent=None,
+    )
+
+    assert await mark_relinked(sid) is False
+
+    user = await fetch_user(sid)
+    assert user["verified"] is False
+    assert user["relink_state"] == "none"
+
+    # The overlay must still find nothing for them.
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT real_email FROM foss_users WHERE synthetic_id = $1 AND verified = TRUE",
+            sid,
+        ) is None
+

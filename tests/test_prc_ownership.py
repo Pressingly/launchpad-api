@@ -34,7 +34,13 @@ async def test_second_verify_of_taken_address_redirects_email_taken(
 
     winner = await raw_client.get("/api/verify?token=tok-winner", follow_redirects=False)
     assert winner.status_code == 302
-    assert "verified=1" in winner.headers["location"]
+    assert "relinking=1" in winner.headers["location"]
+    # The winner must be relink-COMPLETE before the address is exclusive: the
+    # partial index covers verified rows only, and clicking the link no longer
+    # sets verified. This is why mark_pending_relink keeps its own probe --
+    # without it the loser would sit in pending_relink waiting for a relink
+    # that can never complete.
+    assert await db.mark_relinked(sid1) is True
 
     loser = await raw_client.get("/api/verify?token=tok-loser", follow_redirects=False)
     assert loser.status_code != 500, "a legitimate link must never 500 (§3.4)"
@@ -50,6 +56,7 @@ async def test_verified_address_blocks_a_second_verification(raw_client, cleanup
     await seed_pending(sid2, email, "tok-second")
 
     await raw_client.get("/api/verify?token=tok-first", follow_redirects=False)
+    assert await db.mark_relinked(sid1) is True
     await raw_client.get("/api/verify?token=tok-second", follow_redirects=False)
 
     assert (await db.fetch_user(sid1))["verified"] is True

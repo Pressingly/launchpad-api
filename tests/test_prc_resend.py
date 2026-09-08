@@ -20,6 +20,7 @@ from tests.conftest import (
     new_email,
     new_sid,
     seed_pending,
+    seed_relinked,
     sha256_hex,
     submit,
 )
@@ -66,8 +67,8 @@ async def test_concurrent_resends_leave_exactly_one_live_token(
     assert "verify_error=expired_or_invalid" in stale.headers["location"]
 
     live = await raw_client.get(f"/api/verify?token={winner}", follow_redirects=False)
-    assert "verified=1" in live.headers["location"]
-    assert (await db.fetch_user(sid))["verified"] is True
+    assert "relinking=1" in live.headers["location"]
+    assert (await db.fetch_user(sid))["relink_state"] == "pending_relink"
 
 
 async def test_resend_refreshes_verification_expires(
@@ -92,9 +93,10 @@ async def test_resend_refreshes_verification_expires(
 async def test_resend_already_verified_returns_409(raw_client, cleanup_test_users):
     """Deliberate API change (§5): one user state, one status code — 409, to
     match §2.3's 409 on submit."""
+    # A relink-complete user, not merely one who clicked the link: `verified` is
+    # what /api/email/resend refuses on, and only the relink sets it.
     sid = new_sid()
-    await seed_pending(sid, new_email("resend"), "tok-verify-me")
-    await raw_client.get("/api/verify?token=tok-verify-me", follow_redirects=False)
+    await seed_relinked(sid, new_email("resend"))
 
     response = await _resend(raw_client, sid)
 
