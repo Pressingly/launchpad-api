@@ -244,7 +244,10 @@ async def authz(
             # them to re-auth instead.
             #
             # Known carve-out, NOT covered here: `twenty-mcp-bypass`
-            # (docker-compose.yml) matches /mcp, /oauth/ and /.well-known/oauth
+            # (docker-compose.yml) matches /mcp, /oauth/, /.well-known/oauth and
+            # /authorize -- the last being an SPA route with no server handler,
+            # which redirects an unauthenticated visitor back into the gated
+            # /auth/sso/proxy-login path
             # at priority 20, ahead of twenty-secure, with no mpass-auth in its
             # chain -- so no identity header reaches it and there is nothing for
             # this gate to decide on. That is Twenty's own MCP OAuth, which must

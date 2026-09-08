@@ -60,11 +60,17 @@ async def verified_state(
 
     user = await db.fetch_user(sid)
     verified = bool(user and user["verified"])
+
+    if _tombstones.get(sid, -1.0) >= t:
+        # Evicted while this lookup was in flight; the answer is already stale.
+        return verified, user["real_email"] if user else None
     email = user["real_email"] if user else None
 
     if len(_cache) >= _CACHE_MAX_ENTRIES:
         for k in [k for k, v in _cache.items() if v.expires_at <= t]:
             del _cache[k]
+        for k in [k for k, ts in _tombstones.items() if ts <= t]:
+            del _tombstones[k]
         if len(_cache) >= _CACHE_MAX_ENTRIES:
             # Everything is live: drop the entry closest to expiry rather than
             # grow without bound. Losing a memo costs one database read.
@@ -72,6 +78,15 @@ async def verified_state(
 
     _cache[sid] = _CacheEntry(verified=verified, email=email, expires_at=t + ttl_seconds)
     return verified, email
+
+
+# Set by evict(). verified_state captures the clock before its await and skips
+# writing a memo that an evict beat it to -- otherwise a lookup already in
+# flight when the user clicks their verification link resumes afterwards and
+# re-inserts verified=False with a fresh TTL, which is exactly the stale bounce
+# evict exists to prevent. Checking `sid not in _cache` is not enough: the entry
+# legitimately is not there yet.
+_tombstones: dict[str, float] = {}
 
 
 def evict(sid: str) -> None:
@@ -82,8 +97,10 @@ def evict(sid: str) -> None:
     the TTL, so the gate bounces them back to /?collect=1 -- where /api/me now
     reports verified, so no modal renders and they see an unexplained bounce."""
     _cache.pop(sid, None)
+    _tombstones[sid] = time.monotonic()
 
 
 def _clear_cache() -> None:
-    """Drop every memoized entry. Test helper only."""
+    """Drop every memoized entry and tombstone. Test helper only."""
     _cache.clear()
+    _tombstones.clear()
