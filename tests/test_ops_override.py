@@ -763,7 +763,9 @@ async def test_the_synthetic_refusal_is_skipped_when_the_domain_is_unset(monkeyp
     assert "relink" in result.lower() or "complete" in result.lower()
 
 
-async def test_a_missing_audit_vocabulary_is_refused_not_a_traceback(monkeypatch):
+async def test_a_missing_audit_vocabulary_is_refused_not_a_traceback(
+    monkeypatch, admin_conn
+):
     """'ops_override' is an accepted audit action only after the audit CHECK is
     widened -- a SEPARATE runbook step from the relink_state migration, so an
     upgrader can apply one and not the other.
@@ -773,22 +775,42 @@ async def test_a_missing_audit_vocabulary_is_refused_not_a_traceback(monkeypatch
     means refused. Nothing is lost either way (the row and audit writes share a
     transaction), but an operator mid-incident cannot tell that the schema is
     the problem.
+
+    Uses admin_conn, NOT db.get_pool(). foss_users_audit is owned by `postgres`
+    (init-databases.sh runs as $POSTGRES_USER) and launchpad_api_user holds only
+    SELECT, INSERT -- ALTER TABLE needs ownership. Over the application pool
+    this raises InsufficientPrivilegeError in setup and the assertions below
+    never run, which is the failure mode conftest's admin_conn fixture exists
+    for.
+
+    Both ALTERs live inside the try: a failure between the DROP and the ADD
+    would otherwise leave the table with no CHECK at all for the rest of the
+    session, and every later test relying on the vocabulary being enforced
+    would pass vacuously.
     """
     monkeypatch.setattr(settings, "synthetic_email_domain", "askii.ai")
     sid, email = new_sid(), new_email("noaudit")
     await seed_pending(sid, email, "tok-noaudit")
 
-    pool = await db.get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "ALTER TABLE foss_users_audit DROP CONSTRAINT foss_users_audit_action_check"
-        )
-        await conn.execute(
-            "ALTER TABLE foss_users_audit ADD CONSTRAINT foss_users_audit_action_check "
-            "CHECK (action IN ('submit_email','verify_email','resend_verification',"
-            "'dismiss_modal','submit_email_collision','rate_limited'))"
-        )
+    _FULL = (
+        "'submit_email','verify_email','resend_verification','dismiss_modal',"
+        "'submit_email_collision','rate_limited','ops_override'"
+    )
+    _NARROWED = (
+        "'submit_email','verify_email','resend_verification','dismiss_modal',"
+        "'submit_email_collision','rate_limited'"
+    )
+
     try:
+        await admin_conn.execute(
+            "ALTER TABLE foss_users_audit "
+            "DROP CONSTRAINT IF EXISTS foss_users_audit_action_check"
+        )
+        await admin_conn.execute(
+            "ALTER TABLE foss_users_audit ADD CONSTRAINT "
+            f"foss_users_audit_action_check CHECK (action IN ({_NARROWED}))"
+        )
+
         with pytest.raises(OverrideRefused) as exc:
             await _override(
                 sid, new_email("noaudit-new"), runner="manual", relink_done=True
@@ -796,7 +818,9 @@ async def test_a_missing_audit_vocabulary_is_refused_not_a_traceback(monkeypatch
 
         message = str(exc.value)
         assert "'ops_override'" in message
-        assert "runbook" in message.lower(), "an operator needs the fix, not just the fault"
+        assert "runbook" in message.lower(), (
+            "an operator needs the fix, not just the fault"
+        )
 
         # The transaction rolled back cleanly: no half-applied override.
         user = await db.fetch_user(sid)
@@ -804,12 +828,36 @@ async def test_a_missing_audit_vocabulary_is_refused_not_a_traceback(monkeypatch
         assert user["real_email"] == email
         assert "ops_override" not in [r["action"] for r in await _audit_rows(sid)]
     finally:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "ALTER TABLE foss_users_audit DROP CONSTRAINT foss_users_audit_action_check"
-            )
-            await conn.execute(
-                "ALTER TABLE foss_users_audit ADD CONSTRAINT foss_users_audit_action_check "
-                "CHECK (action IN ('submit_email','verify_email','resend_verification',"
-                "'dismiss_modal','submit_email_collision','rate_limited','ops_override'))"
-            )
+        await admin_conn.execute(
+            "ALTER TABLE foss_users_audit "
+            "DROP CONSTRAINT IF EXISTS foss_users_audit_action_check"
+        )
+        await admin_conn.execute(
+            "ALTER TABLE foss_users_audit ADD CONSTRAINT "
+            f"foss_users_audit_action_check CHECK (action IN ({_FULL}))"
+        )
+
+
+async def test_a_mixed_case_synthetic_address_is_still_refused(monkeypatch):
+    """Round 5 regression. The caller derives the local part from
+    `email.lower()`, so an exact-match probe against synthetic_id never fires
+    for any sid carrying an uppercase character -- and pasting the sid verbatim
+    out of the logs is exactly the input the guard exists to catch.
+
+    Reverting synthetic_id_exists to `WHERE synthetic_id = $1` fails this.
+    """
+    monkeypatch.setattr(settings, "synthetic_email_domain", "askii.ai")
+    victim, attacker = f"test_MiXeD{new_sid()[5:]}", new_sid()
+    await seed_pending(victim, new_email("mixedvictim"), "tok-mixedvictim")
+    await seed_pending(attacker, new_email("mixedattacker"), "tok-mixedattacker")
+    assert any(c.isupper() for c in victim), "the sid must carry case to mean anything"
+
+    with pytest.raises(OverrideRefused) as exc:
+        await _override(
+            attacker, f"{victim}@askii.ai", runner="manual", relink_done=True
+        )
+    assert "another account's synthetic address" in str(exc.value)
+
+    user = await db.fetch_user(attacker)
+    assert user["verified"] is False
+    assert "ops_override" not in [r["action"] for r in await _audit_rows(attacker)]

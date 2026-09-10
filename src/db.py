@@ -580,17 +580,25 @@ async def synthetic_id_exists(synthetic_id: str) -> bool:
     a synthetic address is never stored as anyone's real_email, so the probe has
     to be against synthetic_id instead.
 
-    synthetic_id is the primary key and is stored exactly as the IdP supplies
-    it, so this is an exact match -- deliberately NOT lower(), unlike
-    verified_owner, whose lower() mirrors idx_foss_users_email. A miss here
-    fails open to the checks below, which is the same position the code was in
-    before this probe existed.
+    Case-insensitive, and that is load-bearing rather than tidy. The caller
+    derives its argument from `email.lower().partition("@")`, because an email
+    local part is compared case-insensitively -- so an exact match here would
+    never fire for any synthetic_id containing an uppercase character. That is
+    precisely the input the guard exists to catch: an operator pasting a sid
+    verbatim out of `docker logs`, psql, or the ForwardAuth header. The probe
+    would silently find nothing, the refusal would be skipped, and
+    `<other-sid>@<domain>` would be written as this user's real_email with
+    verified_owner unable to see it either.
+
+    Recognising one address too many is safe -- the result is a refusal, and
+    the operator is told which account they collided with. Recognising one too
+    few is the account-takeover path.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         return (
             await conn.fetchval(
-                "SELECT 1 FROM foss_users WHERE synthetic_id = $1 LIMIT 1",
+                "SELECT 1 FROM foss_users WHERE lower(synthetic_id) = lower($1) LIMIT 1",
                 synthetic_id,
             )
             is not None
