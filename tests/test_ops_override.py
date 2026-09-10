@@ -655,3 +655,161 @@ async def test_runner_refuses_a_stuck_user_even_for_the_same_address():
     msg = str(exc.value)
     assert "never completed" in msg
     assert "--relink-done" in msg, "must point at the path that can actually finish it"
+
+
+# ---------------------------------------------------------------------------
+# Round 4 — a synthetic address is an identity token, not a mailbox
+#
+# The operator can SEE these strings: they are on the ForwardAuth header, in
+# `docker logs`, and in psql. Pasting one is the natural mistake, and nothing
+# in the data checks can catch it -- a synthetic address is never stored as
+# anyone's real_email, so verified_owner() finds no conflict and the write went
+# straight through.
+# ---------------------------------------------------------------------------
+
+
+async def test_own_synthetic_address_is_refused(monkeypatch):
+    """Completing a relink onto the user's OWN synthetic address is a WORSE
+    lockout than the one being fixed: the overlay serves it as verified, and
+    decide_gate then reads relink-complete AND email == f"{sid}@{domain}" ->
+    REFRESH -> /oauth2/sign_in -> the same claim -> REFRESH, forever, on every
+    gated app.
+    """
+    monkeypatch.setattr(settings, "synthetic_email_domain", "askii.ai")
+    sid = new_sid()
+    await seed_pending(sid, new_email("selfsynth"), "tok-selfsynth")
+
+    with pytest.raises(OverrideRefused) as exc:
+        await _override(sid, f"{sid}@askii.ai", runner="manual", relink_done=True)
+
+    message = str(exc.value)
+    assert "own synthetic address" in message
+    assert "not a mailbox" in message
+    # Must name the consequence, not merely refuse: an operator told only
+    # "invalid" retries with a variation of the same string.
+    assert "forever" in message or "sign_in" in message
+
+    # Nothing written, and specifically not verified -- under 'runner' the
+    # command refuses to repair an already-verified row, so a write here would
+    # be a lockout the override itself cannot undo.
+    user = await db.fetch_user(sid)
+    assert user["verified"] is False
+    assert user["relink_state"] == "pending_relink"
+    assert [r["action"] for r in await _audit_rows(sid)] == ["submit_email"]
+
+
+async def test_another_accounts_synthetic_address_is_refused(monkeypatch):
+    """The cross-sid variant is account takeover, not just a lockout: the
+    address resolves to ALLOW (it is not THIS sid's synthetic string), and all
+    five apps key identity on the email string alone.
+    """
+    monkeypatch.setattr(settings, "synthetic_email_domain", "askii.ai")
+    victim, attacker = new_sid(), new_sid()
+    await seed_pending(victim, new_email("victim"), "tok-victim")
+    await seed_pending(attacker, new_email("attacker"), "tok-attacker")
+
+    with pytest.raises(OverrideRefused) as exc:
+        await _override(
+            attacker, f"{victim}@askii.ai", runner="manual", relink_done=True
+        )
+
+    message = str(exc.value)
+    assert "another account's synthetic address" in message
+    assert victim in message, "name the account, so the operator can tell what they hit"
+
+    user = await db.fetch_user(attacker)
+    assert user["verified"] is False
+    assert [r["action"] for r in await _audit_rows(attacker)] == ["submit_email"]
+
+
+async def test_a_real_mailbox_at_the_synthetic_domain_is_still_accepted(monkeypatch):
+    """The refusal is an exact full-string match, NOT an `@domain` suffix test.
+
+    The synthetic domain is also a real Moneta mail domain -- decide_gate
+    matches the whole string for exactly this reason -- so a suffix refusal
+    would reject legitimate mailboxes and lock out the people it is meant to
+    rescue.
+    """
+    monkeypatch.setattr(settings, "synthetic_email_domain", "askii.ai")
+    sid = new_sid()
+    await seed_pending(sid, new_email("realatdomain"), "tok-realatdomain")
+
+    # A real human mailbox that happens to live at the synthetic domain, whose
+    # local part is not any account's synthetic_id.
+    result = await _override(
+        sid, "jane.doe@askii.ai", runner="manual", relink_done=True
+    )
+
+    assert "jane.doe@askii.ai" in result
+    user = await db.fetch_user(sid)
+    assert user["verified"] is True
+    assert user["real_email"] == "jane.doe@askii.ai"
+
+
+async def test_the_synthetic_refusal_is_skipped_when_the_domain_is_unset(monkeypatch):
+    """With SYNTHETIC_EMAIL_DOMAIN empty there is no synthetic string to
+    recognise, and f"{sid}@" would match nothing anyway. Fail open to the checks
+    below rather than refusing everything -- /api/authz already refuses to gate
+    at all in that configuration, so the override is the only way back.
+    """
+    monkeypatch.setattr(settings, "synthetic_email_domain", "")
+    sid = new_sid()
+    await seed_pending(sid, new_email("nodomain"), "tok-nodomain")
+
+    result = await _override(
+        sid, new_email("nodomain-new"), runner="manual", relink_done=True
+    )
+    assert (await db.fetch_user(sid))["verified"] is True
+    assert "relink" in result.lower() or "complete" in result.lower()
+
+
+async def test_a_missing_audit_vocabulary_is_refused_not_a_traceback(monkeypatch):
+    """'ops_override' is an accepted audit action only after the audit CHECK is
+    widened -- a SEPARATE runbook step from the relink_state migration, so an
+    upgrader can apply one and not the other.
+
+    Uncaught, the CheckViolationError escaped run_override as a raw Postgres
+    traceback with exit 1, while the command's documented contract is that 2
+    means refused. Nothing is lost either way (the row and audit writes share a
+    transaction), but an operator mid-incident cannot tell that the schema is
+    the problem.
+    """
+    monkeypatch.setattr(settings, "synthetic_email_domain", "askii.ai")
+    sid, email = new_sid(), new_email("noaudit")
+    await seed_pending(sid, email, "tok-noaudit")
+
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "ALTER TABLE foss_users_audit DROP CONSTRAINT foss_users_audit_action_check"
+        )
+        await conn.execute(
+            "ALTER TABLE foss_users_audit ADD CONSTRAINT foss_users_audit_action_check "
+            "CHECK (action IN ('submit_email','verify_email','resend_verification',"
+            "'dismiss_modal','submit_email_collision','rate_limited'))"
+        )
+    try:
+        with pytest.raises(OverrideRefused) as exc:
+            await _override(
+                sid, new_email("noaudit-new"), runner="manual", relink_done=True
+            )
+
+        message = str(exc.value)
+        assert "'ops_override'" in message
+        assert "runbook" in message.lower(), "an operator needs the fix, not just the fault"
+
+        # The transaction rolled back cleanly: no half-applied override.
+        user = await db.fetch_user(sid)
+        assert user["verified"] is False
+        assert user["real_email"] == email
+        assert "ops_override" not in [r["action"] for r in await _audit_rows(sid)]
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE foss_users_audit DROP CONSTRAINT foss_users_audit_action_check"
+            )
+            await conn.execute(
+                "ALTER TABLE foss_users_audit ADD CONSTRAINT foss_users_audit_action_check "
+                "CHECK (action IN ('submit_email','verify_email','resend_verification',"
+                "'dismiss_modal','submit_email_collision','rate_limited','ops_override'))"
+            )

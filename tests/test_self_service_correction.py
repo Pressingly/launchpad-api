@@ -24,6 +24,8 @@ from tests.conftest import (
     mailpit_messages,
     new_email,
     new_sid,
+    relink_state,
+    seed_pending,
     seed_relinked,
     submit,
 )
@@ -220,3 +222,41 @@ async def test_a_correction_sends_to_the_new_address_only(raw_client, clean_mail
     assert len(messages) == 1
     recipients = [t["Address"] for t in messages[0]["To"]]
     assert recipients == [right]
+
+
+async def test_correcting_from_pending_relink_evicts_the_gate_memo(raw_client):
+    """gate.evict's contract is unconditional: every transition that changes a
+    memoized field evicts. submit_email is such a transition -- its ON CONFLICT
+    resets relink_state from 'pending_relink' to 'none' -- and it did not.
+
+    The user-visible effect is a stale HOLD, not a leak: the gate keeps
+    returning RELINKING instead of COLLECT for up to GATE_CACHE_TTL_SECONDS
+    after the user corrects their address. Fail-closed, and /api/me reads the
+    database directly so the portal panel is already right. Asserted anyway
+    because the invariant is only worth having if it has no exceptions, and the
+    next transition added may not be fail-closed.
+    """
+    from src import gate
+
+    sid, first = new_sid(), new_email("evict-pending")
+    await seed_pending(sid, first, "tok-evict-pending")
+
+    # Move to pending_relink and prime the memo by reading through the gate.
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET relink_state = 'pending_relink' WHERE synthetic_id = $1",
+            sid,
+        )
+    _, _, state = await gate.verified_state(sid, ttl_seconds=300)
+    assert state == "pending_relink", "memo must be primed for the test to mean anything"
+
+    # Correct the address. The row goes back to 'none'.
+    response = await submit(raw_client, sid, new_email("evict-corrected"))
+    assert response.status_code == 202
+    assert await relink_state(sid) == "none"
+
+    # Same generous TTL: without the evict this still answers 'pending_relink'
+    # from the memo, and the gate holds a user who should be at COLLECT.
+    _, _, after = await gate.verified_state(sid, ttl_seconds=300)
+    assert after == "none"

@@ -218,6 +218,53 @@ async def run_override(
             "hand."
         )
 
+    # A synthetic address is an identity token, never a mailbox. Refused here
+    # rather than left to the data checks below, because no data check can see
+    # it: synthetic addresses are never stored as anyone's real_email, so
+    # verified_owner() finds nothing and the write goes straight through.
+    #
+    # Deliberately an exact full-string match, not an `@{domain}` suffix test.
+    # The synthetic domain is also a real Moneta mail domain (see decide_gate's
+    # docstring), so refusing the suffix outright would reject legitimate
+    # mailboxes.
+    #
+    # Two distinct failures, both reachable from an address the operator can
+    # see in `docker logs`, in psql, or on the ForwardAuth header:
+    #
+    #   self  -- completing a relink onto the user's OWN synthetic address makes
+    #            the overlay serve it as verified. decide_gate then reads
+    #            relink-complete AND email == f"{sid}@{domain}" -> REFRESH, which
+    #            302s to /oauth2/sign_in, re-mints the same claim and returns
+    #            REFRESH again: an infinite redirect on every gated app. That is
+    #            a harder lockout than the one the override was reached for, and
+    #            under 'runner' this command then refuses to repair it because
+    #            the user is already verified.
+    #
+    #   cross -- another account's synthetic address resolves to ALLOW, and all
+    #            five apps key identity on the email string, so this sid is
+    #            handed that account's data.
+    synthetic_domain = settings.synthetic_email_domain
+    if synthetic_domain:
+        if email.lower() == f"{synthetic_id}@{synthetic_domain}".lower():
+            raise OverrideRefused(
+                f"{email} is {synthetic_id}'s own synthetic address, not a "
+                "mailbox. Completing a relink onto it makes the overlay serve "
+                "the synthetic address as if it were verified, and the gate "
+                "then bounces the user through /oauth2/sign_in forever -- a "
+                "worse lockout than the one you are fixing. Use the real "
+                "address the user gave you."
+            )
+        local_part, _, domain = email.lower().partition("@")
+        if domain == synthetic_domain.lower() and await db.synthetic_id_exists(
+            local_part
+        ):
+            raise OverrideRefused(
+                f"{email} is another account's synthetic address (synthetic_id "
+                f"{local_part}), not a mailbox. Every app keys identity on the "
+                f"email string, so this would hand {synthetic_id} that "
+                "account's data. Use the real address the user gave you."
+            )
+
     # -- Refusals that depend on the data -----------------------------------
     # Address squatting, and only that: the address is already VERIFIED by a
     # different account. Surface it with the conflicting sid rather than letting
@@ -321,6 +368,19 @@ async def run_override(
             f"{email} was verified by another account between this command's "
             "check and its write. Nothing was written. Resolve the conflict "
             "and re-run."
+        )
+    except db.AuditVocabularyMissing:
+        # A schema gap, not a conflict. Refuse with exit 2 and name the fix:
+        # untranslated this reached the operator as a raw Postgres traceback
+        # with exit 1, giving no hint that a migration step was skipped.
+        raise OverrideRefused(
+            "This database's foss_users_audit CHECK does not accept the "
+            "'ops_override' action yet, so the override cannot be audited and "
+            "nothing was written.\n\n"
+            "The audit-vocabulary widening is a separate step from the "
+            "relink_state migration -- applying one does not apply the other. "
+            "Run the audit-vocabulary block in dev/docs/launchpad-runbook.md "
+            "against the launchpad database, then re-run."
         )
 
     if mode == RUNNER_RUNNER:

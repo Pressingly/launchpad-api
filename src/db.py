@@ -58,6 +58,16 @@ class NoSubmissionYet(Exception):
     """The caller has no foss_users row to act on."""
 
 
+class AuditVocabularyMissing(Exception):
+    """foss_users_audit's CHECK does not accept 'ops_override' yet.
+
+    A schema gap, not a data conflict: the audit-vocabulary widening is a
+    separate runbook step from the relink_state block, so an upgrader can apply
+    one without the other. Raised so the ops override can report it as a
+    refusal with a fix, rather than as a raw Postgres traceback.
+    """
+
+
 _pool: Optional[asyncpg.Pool] = None
 
 
@@ -263,7 +273,26 @@ async def submit_email(
                 ip_address=ip_address,
                 user_agent=user_agent,
             )
-            return bool(collision)
+            _collision = bool(collision)
+
+    # Outside the transaction, so the memo is never dropped for a write that
+    # then rolls back. The ON CONFLICT above resets relink_state from
+    # 'pending_relink' to 'none', and the memo carries relink_state as well as
+    # the address -- so a user who corrects their address while held at
+    # RELINKING would keep being held for up to the TTL instead of being sent
+    # back to COLLECT.
+    #
+    # That direction is fail-closed (held, not released) and /api/me reads the
+    # database directly, so the portal panel is already correct. Evicting anyway
+    # because gate.evict's contract is unconditional: every transition that
+    # changes a memoized field evicts. The next transition added may not be
+    # fail-closed, and the invariant is only useful if it has no exceptions.
+    #
+    # Imported locally, like the other two evict sites: src.gate imports src.db,
+    # so a module-level import here is circular.
+    from src import gate as _gate
+    _gate.evict(synthetic_id)
+    return _collision
 
 
 async def mark_pending_relink(
@@ -543,6 +572,31 @@ async def verified_owner(email: str) -> Optional[str]:
         )
 
 
+async def synthetic_id_exists(synthetic_id: str) -> bool:
+    """Whether any row carries this synthetic_id.
+
+    Used only by the ops override, to recognise `<other-sid>@<synthetic_domain>`
+    as an identity token rather than a mailbox. verified_owner cannot see it:
+    a synthetic address is never stored as anyone's real_email, so the probe has
+    to be against synthetic_id instead.
+
+    synthetic_id is the primary key and is stored exactly as the IdP supplies
+    it, so this is an exact match -- deliberately NOT lower(), unlike
+    verified_owner, whose lower() mirrors idx_foss_users_email. A miss here
+    fails open to the checks below, which is the same position the code was in
+    before this probe existed.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return (
+            await conn.fetchval(
+                "SELECT 1 FROM foss_users WHERE synthetic_id = $1 LIMIT 1",
+                synthetic_id,
+            )
+            is not None
+        )
+
+
 async def ops_override_write(
     synthetic_id: str,
     email: str,
@@ -653,16 +707,30 @@ async def ops_override_write(
                     raise
                 raise EmailAlreadyRegistered(email) from exc
 
-            await _insert_audit(
-                conn,
-                synthetic_id=synthetic_id,
-                action="ops_override",
-                email=email,
-                consent_text_version=None,
-                consent_text_content=None,
-                ip_address=None,
-                user_agent=audit_note,
-            )
+            try:
+                await _insert_audit(
+                    conn,
+                    synthetic_id=synthetic_id,
+                    action="ops_override",
+                    email=email,
+                    consent_text_version=None,
+                    consent_text_content=None,
+                    ip_address=None,
+                    user_agent=audit_note,
+                )
+            except asyncpg.CheckViolationError as exc:
+                # 'ops_override' is only an accepted action once the audit CHECK
+                # has been widened -- a SEPARATE runbook step from the
+                # relink_state block, so an upgrader can apply one and not the
+                # other. Uncaught, this escaped run_override as a raw Postgres
+                # traceback and exit 1, while the command's documented contract
+                # is that 2 means refused. Nothing is lost either way (the audit
+                # and row writes share this transaction, so the rollback is
+                # clean), but an operator mid-incident has no way to tell that
+                # the schema is the problem.
+                if exc.constraint_name != "foss_users_audit_action_check":
+                    raise
+                raise AuditVocabularyMissing() from exc
 
     # Same reason mark_relinked evicts: the memo holds the address as well as
     # the state, so an override that did not evict would leave the gate handing
