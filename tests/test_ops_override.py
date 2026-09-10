@@ -676,8 +676,8 @@ async def test_own_synthetic_address_is_refused(monkeypatch):
     gated app.
     """
     monkeypatch.setattr(settings, "synthetic_email_domain", "askii.ai")
-    sid = new_sid()
-    await seed_pending(sid, new_email("selfsynth"), "tok-selfsynth")
+    sid, seeded = new_sid(), new_email("selfsynth")
+    await seed_pending(sid, seeded, "tok-selfsynth")
 
     with pytest.raises(OverrideRefused) as exc:
         await _override(sid, f"{sid}@askii.ai", runner="manual", relink_done=True)
@@ -689,13 +689,17 @@ async def test_own_synthetic_address_is_refused(monkeypatch):
     # "invalid" retries with a variation of the same string.
     assert "forever" in message or "sign_in" in message
 
-    # Nothing written, and specifically not verified -- under 'runner' the
-    # command refuses to repair an already-verified row, so a write here would
-    # be a lockout the override itself cannot undo.
+    # Nothing written: the row is exactly as seeded. Asserted against the
+    # SEEDED values rather than against a state seed_pending never produces --
+    # it inserts directly, so relink_state is its 'none' default and no audit
+    # row exists. `verified is False` is the load-bearing one: under 'runner'
+    # the command refuses to touch an already-verified row, so a write here
+    # would be a lockout the override itself cannot undo.
     user = await db.fetch_user(sid)
     assert user["verified"] is False
-    assert user["relink_state"] == "pending_relink"
-    assert [r["action"] for r in await _audit_rows(sid)] == ["submit_email"]
+    assert user["real_email"] == seeded, "the synthetic address must not have been stored"
+    assert user["relink_state"] == "none"
+    assert "ops_override" not in [r["action"] for r in await _audit_rows(sid)]
 
 
 async def test_another_accounts_synthetic_address_is_refused(monkeypatch):
@@ -705,8 +709,9 @@ async def test_another_accounts_synthetic_address_is_refused(monkeypatch):
     """
     monkeypatch.setattr(settings, "synthetic_email_domain", "askii.ai")
     victim, attacker = new_sid(), new_sid()
+    attacker_seeded = new_email("attacker")
     await seed_pending(victim, new_email("victim"), "tok-victim")
-    await seed_pending(attacker, new_email("attacker"), "tok-attacker")
+    await seed_pending(attacker, attacker_seeded, "tok-attacker")
 
     with pytest.raises(OverrideRefused) as exc:
         await _override(
@@ -717,9 +722,14 @@ async def test_another_accounts_synthetic_address_is_refused(monkeypatch):
     assert "another account's synthetic address" in message
     assert victim in message, "name the account, so the operator can tell what they hit"
 
+    # Nothing written. seed_pending inserts directly, so there is no audit row
+    # to compare against -- the assertion that carries weight is that the
+    # victim's synthetic address was not stored as the attacker's real_email,
+    # which is the takeover itself.
     user = await db.fetch_user(attacker)
     assert user["verified"] is False
-    assert [r["action"] for r in await _audit_rows(attacker)] == ["submit_email"]
+    assert user["real_email"] == attacker_seeded
+    assert "ops_override" not in [r["action"] for r in await _audit_rows(attacker)]
 
 
 async def test_a_real_mailbox_at_the_synthetic_domain_is_still_accepted(monkeypatch):
