@@ -186,16 +186,64 @@ async def authz(
     request: Request,
     x_auth_request_preferred_username: str = Header(default=""),
     x_auth_request_email: str = Header(default=""),
+    x_auth_request_user: str = Header(default=""),
+    x_auth_request_access_token: str = Header(default=""),
 ):
     """Edge verify-gate (ADR-0018). Traefik ForwardAuth calls this after the
     mpass-auth login check on every *application* router. It never runs for the
     portal or /api/* routers, so an unverified user can always reach the
     collection flow."""
     sid = x_auth_request_preferred_username
+    proto = request.headers.get("x-forwarded-proto", settings.platform_protocol)
+    host = request.headers.get("x-forwarded-host", settings.platform_domain)
+    wants_html = "text/html" in request.headers.get("accept", "")
+
     if not sid:
-        # mpass-auth runs before this gate, so identity is always present in a
-        # correct config. Its absence means a wiring mistake — fail closed.
-        raise HTTPException(status_code=401, detail="missing identity")
+        # mpass-auth-proxy only stamps preferred_username when it RE-SIGNS the
+        # id_token, which only happens under LAUNCHPAD_EMAIL_CAPTURE=true. A
+        # session minted before that flip authenticates fine at oauth2-proxy --
+        # the other three identity headers are present -- but carries no
+        # preferred_username. That's a STALE SESSION, not a wiring fault, and
+        # sending the user through sign_in re-mints the token with the claim.
+        # Only when every identity header is absent do we know mpass-auth
+        # never ran at all, which is the original wiring-fault case.
+        other_identity_present = bool(
+            x_auth_request_email or x_auth_request_user or x_auth_request_access_token
+        )
+        if not other_identity_present:
+            raise HTTPException(status_code=401, detail="missing identity")
+
+        uri = request.headers.get("x-forwarded-uri", "/")
+        if "launchpad_stale_retry=1" in uri:
+            # Second arrival still missing the claim: re-login did not fix it,
+            # so this was never a stale session -- something else is wrong.
+            # Fall through to the same fail-closed 401 instead of redirecting
+            # again, or every app loops forever between sign_in and this gate.
+            raise HTTPException(status_code=401, detail="missing identity")
+
+        if not wants_html:
+            # Mirrors the REFRESH non-html branch below: don't wave a
+            # programmatic caller through, tell it to re-auth instead.
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "stale_session",
+                    "detail": (
+                        "Your session predates email capture and is missing "
+                        "a required identity claim. Re-authenticate to "
+                        "refresh it."
+                    ),
+                },
+            )
+
+        # Same split as REFRESH/COLLECT/RELINKING below: browsers get a 302
+        # straight to sign_in, programmatic callers got their 403 above.
+        sep = "&" if "?" in uri else "?"
+        rd = quote(f"{proto}://{host}{uri}{sep}launchpad_stale_retry=1", safe="")
+        return RedirectResponse(
+            url=f"{proto}://{host}/oauth2/sign_in?rd={rd}",
+            status_code=302,
+        )
 
     if not settings.synthetic_email_domain:
         # Without it, decide_gate compares against f"{sid}@" -- a string no real
@@ -243,13 +291,8 @@ async def authz(
         sid=sid,
         synthetic_domain=settings.synthetic_email_domain,
     )
-    wants_html = "text/html" in request.headers.get("accept", "")
-
     if action is GateAction.ALLOW:
         return Response(status_code=200)
-
-    proto = request.headers.get("x-forwarded-proto", settings.platform_protocol)
-    host = request.headers.get("x-forwarded-host", settings.platform_domain)
 
     if action is GateAction.REFRESH:
         if not wants_html:

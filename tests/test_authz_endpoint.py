@@ -270,3 +270,78 @@ async def test_authz_503s_when_synthetic_domain_is_unset(client, monkeypatch):
 async def test_authz_missing_identity_is_401(client):
     r = await client.get("/api/authz", headers={"Accept": "text/html"})
     assert r.status_code == 401
+
+
+async def test_authz_stale_session_redirects_once(client):
+    """No preferred_username but the other three identity headers are present
+    -- oauth2-proxy authenticated the session before mpass-auth-proxy started
+    re-signing tokens with the claim. Send the browser to sign_in rather than
+    dead-ending with a 401 it can't recover from."""
+    r = await client.get(
+        "/api/authz",
+        headers={
+            "X-Auth-Request-Email": "jane@corp.com",
+            "X-Auth-Request-User": "jane@corp.com",
+            "X-Auth-Request-Access-Token": "tok_abc",
+            "Accept": "text/html",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "pm.foss.local.dev",
+            "X-Forwarded-Uri": "/projects",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code == 302
+    loc = r.headers["location"]
+    assert loc.startswith("https://pm.foss.local.dev/oauth2/sign_in?")
+    rd = urllib.parse.parse_qs(urllib.parse.urlsplit(loc).query)["rd"]
+    assert rd == ["https://pm.foss.local.dev/projects?launchpad_stale_retry=1"]
+
+
+async def test_authz_stale_session_api_client_gets_403(client):
+    """Same missing-claim case for a programmatic caller: no auto-redirect
+    possible, so tell it to re-authenticate instead."""
+    r = await client.get(
+        "/api/authz",
+        headers={
+            "X-Auth-Request-Email": "jane@corp.com",
+            "Accept": "application/json",
+        },
+    )
+    assert r.status_code == 403
+    assert r.json()["error"] == "stale_session"
+
+
+async def test_authz_second_arrival_still_missing_identity_falls_through_to_401(client):
+    """The retry marker comes back on X-Forwarded-Uri after a completed
+    sign_in round trip. If preferred_username is STILL absent, re-login did
+    not fix it -- this is not a stale session, so fail closed exactly like the
+    original 401 rather than redirecting forever."""
+    r = await client.get(
+        "/api/authz",
+        headers={
+            "X-Auth-Request-Email": "jane@corp.com",
+            "Accept": "text/html",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "pm.foss.local.dev",
+            "X-Forwarded-Uri": "/projects?launchpad_stale_retry=1",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code == 401
+    assert r.json()["detail"] == "missing identity"
+
+
+async def test_authz_all_identity_headers_absent_still_401s_immediately(client):
+    """No preferred_username and none of the other three headers either --
+    mpass-auth never ran at all. A genuine wiring fault, not a stale session:
+    fail closed immediately, no redirect."""
+    r = await client.get(
+        "/api/authz",
+        headers={
+            "Accept": "text/html",
+            "X-Forwarded-Uri": "/projects",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code == 401
+    assert r.json()["detail"] == "missing identity"
