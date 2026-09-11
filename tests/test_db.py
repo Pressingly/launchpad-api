@@ -348,6 +348,38 @@ async def test_mark_relinked_completes_a_legacy_verified_row(cleanup_test_users)
     assert await _state(sid) == "relinked"
 
 
+async def test_mark_relinked_clears_relink_error(cleanup_test_users):
+    """A stale refusal must not survive a completed relink -- otherwise a user
+    who is done reads as failed to anything that looks at the column
+    directly."""
+    sid = _sid()
+    await _submit(sid, _email(), "tok-recover")
+    await mark_pending_relink(hash_token("tok-recover"), None, None)
+    # Set the failed state directly: the runner is a separate image and owns
+    # this transition itself, so launchpad-api has no such helper.
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET relink_state = 'relink_failed', "
+            "relink_error = $2 WHERE synthetic_id = $1",
+            sid, "temporary collision",
+        )
+    assert (await fetch_user(sid))["relink_error"] is not None
+
+    # Re-queue the way an operator or the runner would, then complete it.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET relink_state = 'pending_relink' "
+            "WHERE synthetic_id = $1",
+            sid,
+        )
+    assert await mark_relinked(sid) is True
+
+    user = await fetch_user(sid)
+    assert user["relink_state"] == "relinked"
+    assert user["relink_error"] is None
+
+
 async def test_resubmitting_clears_a_pending_relink(cleanup_test_users):
     """A fresh submission starts the flow over, so it must not leave the row
     claiming a relink is in flight for an address that has just changed."""

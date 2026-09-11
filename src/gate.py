@@ -52,8 +52,19 @@ def decide_gate(
 
     pending_relink is checked first and never falls through: that population is
     the one for whom an app visit creates the duplicate account, because their
-    relink has not happened yet."""
-    if relink_state == "pending_relink":
+    relink has not happened yet.
+
+    relink_failed is held the same way, on the same GateAction. A refusal (a
+    collision the runner cannot resolve on its own) leaves the user's app
+    accounts exactly as unmoved as pending_relink does, so letting them through
+    creates the identical duplicate-account bug. Resubmitting from COLLECT would
+    only issue another verification link and walk them back into the same
+    refusal -- the loop this gate exists to prevent -- so COLLECT is not an
+    option either. Distinguishing "still working on it" from "needs an
+    administrator" is a message for /api/me and the portal to draw from
+    relink_state; the gate only needs to know the user is not through yet, and
+    both states agree on that."""
+    if relink_state in ("pending_relink", "relink_failed"):
         return GateAction.RELINKING
     if not is_relink_complete(verified=verified, relink_state=relink_state):
         return GateAction.COLLECT

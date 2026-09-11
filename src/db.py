@@ -99,7 +99,7 @@ async def fetch_user(synthetic_id: str) -> Optional[dict]:
         row = await conn.fetchrow(
             """
             SELECT synthetic_id, real_email, display_name, verified,
-                   relink_state,
+                   relink_state, relink_error,
                    verification_token, verification_expires,
                    verified_at, created_at, updated_at
             FROM foss_users WHERE synthetic_id = $1
@@ -403,6 +403,13 @@ async def mark_relinked(synthetic_id: str) -> bool:
                     UPDATE foss_users
                     SET verified = TRUE,
                         relink_state = 'relinked',
+                        -- Cleared unconditionally. A prior refusal recorded here
+                        -- is now stale the moment the relink completes -- by any
+                        -- path, including a retry after the runner or an
+                        -- operator resolved the collision -- and a lingering
+                        -- value would misreport a completed user as failed to
+                        -- anything that reads the column directly.
+                        relink_error = NULL,
                         verification_token = NULL,
                         verification_expires = NULL,
                         verified_at = COALESCE(verified_at, now()),

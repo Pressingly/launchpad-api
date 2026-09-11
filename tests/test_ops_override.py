@@ -871,3 +871,81 @@ async def test_a_mixed_case_synthetic_address_is_still_refused(monkeypatch):
     user = await db.fetch_user(attacker)
     assert user["verified"] is False
     assert "ops_override" not in [r["action"] for r in await _audit_rows(attacker)]
+
+
+# ---------------------------------------------------------------------------
+# relink_failed re-queueing (FOSS-267 part 2, the runner)
+# ---------------------------------------------------------------------------
+
+
+async def _force_relink_state(sid: str, state: str) -> None:
+    """Directly set relink_state, the same way the stuck-mid-relink tests
+    above force a state the code paths cannot reach on their own -- here,
+    because seeding a `relink_failed` row is the runner's job (owned
+    elsewhere), not this module's."""
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET relink_state = $2 WHERE synthetic_id = $1",
+            sid, state,
+        )
+
+
+async def test_runner_requeues_a_relink_failed_user_once_the_collision_is_gone():
+    """The operator's real workflow: the runner refused with relink_failed,
+    a human resolves the collision by hand, then re-runs this same command to
+    put the user back in the queue. There is no dedicated flag for this --
+    `ops_override_write` sets relink_state = 'pending_relink' unconditionally,
+    so the ordinary runner-mode call is the re-queue mechanism."""
+    sid, email = new_sid(), new_email("requeue")
+    await seed_pending(sid, email, "tok-requeue")
+    await _force_relink_state(sid, "relink_failed")
+    assert (await db.fetch_user(sid))["relink_state"] == "relink_failed"
+
+    message = await _override(sid, email, runner="runner")
+    assert "queued" in message
+
+    user = await db.fetch_user(sid)
+    assert user["relink_state"] == "pending_relink"
+    assert user["verified"] is False
+    assert [r["action"] for r in await _audit_rows(sid)] == ["ops_override"]
+
+
+async def test_a_relink_failed_row_does_not_take_the_already_queued_shortcut():
+    """The no-op short-circuit matches relink_state == 'pending_relink'
+    exactly. A relink_failed row must NOT be mistaken for an already-queued
+    one -- that would report success while leaving the row stuck exactly where
+    the runner refused it, with no audit trail of the re-queue ever having
+    happened."""
+    sid, email = new_sid(), new_email("notyetqueued")
+    await seed_pending(sid, email, "tok-notyetqueued")
+    await _force_relink_state(sid, "relink_failed")
+
+    message = await _override(sid, email, runner="runner")
+
+    assert "already queued" not in message
+    assert "Nothing to do" not in message
+    user = await db.fetch_user(sid)
+    assert user["relink_state"] == "pending_relink"
+    assert [r["action"] for r in await _audit_rows(sid)] == ["ops_override"]
+
+
+async def test_relink_failed_still_refuses_while_the_collision_is_unresolved():
+    """Re-queueing must still go through the ordinary collision check: if the
+    address the relink_failed row wants is verified by another account, this
+    command refuses exactly as it would for any other row, because nothing
+    about relink_failed grants an exemption from address-squatting."""
+    owner, addr = new_sid(), new_email("stillcollided")
+    await seed_relinked(owner, addr)
+
+    victim = new_sid()
+    await seed_pending(victim, new_email("victim-collided"), "tok-victim-collided")
+    await _force_relink_state(victim, "relink_failed")
+
+    with pytest.raises(OverrideRefused) as exc:
+        await _override(victim, addr, runner="runner")
+    assert owner in str(exc.value)
+
+    unchanged = await db.fetch_user(victim)
+    assert unchanged["relink_state"] == "relink_failed"
+    assert await _audit_rows(victim) == []

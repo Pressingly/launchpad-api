@@ -160,6 +160,18 @@ async def get_me(x_auth_request_preferred_username: str = Header(default="")):
             display_name=user["display_name"],
         )
 
+    # Same ordering reason as pending_relink above: a refused relink must not
+    # fall through to "verified" on a stale flag, nor to the pending_verification
+    # branch below, which would offer a resubmit that only recreates the same
+    # refusal. relink_error is deliberately not returned here -- see
+    # UserStateResponse.state.
+    if user["relink_state"] == "relink_failed":
+        return UserStateResponse(
+            state="relink_failed",
+            email=user["real_email"],
+            display_name=user["display_name"],
+        )
+
     if user["verified"]:
         return UserStateResponse(
             state="verified",

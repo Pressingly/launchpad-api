@@ -34,6 +34,18 @@ The same three values gate `platform.sh --up` (`_validate_launchpad_switch`).
 Both sides match exactly and case-sensitively; if you change one, change the
 other and the runbook table with it.
 
+Re-queueing a `relink_failed` user
+-----------------------------------
+Under `runner` mode, a relink script exiting 2 (a collision a human must
+resolve) sets `relink_state = 'relink_failed'`; the runner will not retry it.
+There is no separate flag for putting that user back in the queue: once an
+operator has resolved the collision by hand, the ordinary `runner`-mode
+invocation of this command (no `--relink-done`) re-queues them, because
+`db.ops_override_write` sets `relink_state = 'pending_relink'`
+unconditionally, regardless of what state the row was already in. See the
+comment above the idempotence check in `run_override` for why this does not
+collide with the "already queued" no-op.
+
 `--relink-done` is unverified, deliberately
 -------------------------------------------
 Nothing here checks that the five app accounts were actually relinked; the
@@ -313,6 +325,20 @@ async def run_override(
             f"{synthetic_id} is already queued for relink onto {email}. "
             "Nothing to do; no audit row written."
         )
+
+    # `relink_state == "pending_relink"` above is an exact match, deliberately
+    # not "already enqueued in some sense": a `relink_failed` row (the runner
+    # hit a collision, or a script that kept failing) does NOT match it, so it never
+    # takes this no-op branch. That is what makes re-queueing work below --
+    # there is no new flag for it. Once the operator has resolved the
+    # collision by hand (freeing the address `verified_owner` checks above),
+    # a plain runner-mode re-run of this same command falls through to the
+    # ordinary write further down, and `db.ops_override_write` sets
+    # relink_state = 'pending_relink' unconditionally regardless of the row's
+    # current state -- so re-running this command IS how an operator re-queues
+    # a relink_failed user. If a future change adds a guard keyed on
+    # relink_state here, it must not treat 'relink_failed' as "already
+    # handled", or re-queueing silently stops working.
 
     # A relink-complete user's address is LIVE -- the overlay is serving it and
     # the apps are keyed to it. Enqueueing would leave that true while the
