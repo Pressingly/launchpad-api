@@ -6,7 +6,7 @@ a re-submit by an already-verified caller is a terminal 409 and the row is
 left untouched.
 """
 from src import db
-from tests.conftest import new_email, new_sid, seed_pending, submit
+from tests.conftest import new_email, new_sid, seed_relinked, submit
 
 EXPECTED_DETAIL = (
     "This account already has a verified email address. "
@@ -15,11 +15,11 @@ EXPECTED_DETAIL = (
 
 
 async def _verified_user(raw_client) -> tuple:
+    """A relink-complete user. `verified` is what the 409 keys on, and clicking
+    the verification link no longer sets it -- only the relink does."""
     sid = new_sid()
     email = new_email("deverify")
-    await seed_pending(sid, email, f"tok-{sid}")
-    resp = await raw_client.get(f"/api/verify?token=tok-{sid}", follow_redirects=False)
-    assert "verified=1" in resp.headers.get("location", "")
+    await seed_relinked(sid, email)
     return sid, email
 
 

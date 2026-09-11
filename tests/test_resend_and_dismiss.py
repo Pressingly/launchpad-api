@@ -2,7 +2,7 @@
 import secrets
 
 from src import db
-from tests.conftest import seed_pending
+from tests.conftest import seed_pending, seed_relinked
 
 
 async def test_resend_for_pending_user(client, cleanup_test_users):
@@ -24,9 +24,7 @@ async def test_resend_rejects_already_verified(client, cleanup_test_users):
     """409, not the 400 this returned before PRD §5 — one user state, one
     status code, matching §2.3's 409 for the same state on submit."""
     sid = f"test_{secrets.token_hex(4)}"
-    await seed_pending(sid, f"jane-{secrets.token_hex(4)}@example.com", "tok")
-    verified = await client.get("/api/verify?token=tok", follow_redirects=False)
-    assert "verified=1" in verified.headers["location"]
+    await seed_relinked(sid, f"jane-{secrets.token_hex(4)}@example.com")
 
     response = await client.post(
         "/api/email/resend",

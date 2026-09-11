@@ -63,7 +63,7 @@ MIGRATION_SQL = [
     "ALTER TABLE foss_users_audit DROP CONSTRAINT IF EXISTS foss_users_audit_action_check",
     "ALTER TABLE foss_users_audit ADD CONSTRAINT foss_users_audit_action_check "
     "CHECK (action IN ('submit_email', 'verify_email', 'resend_verification', "
-    "'dismiss_modal', 'submit_email_collision', 'rate_limited'))",
+    "'dismiss_modal', 'submit_email_collision', 'rate_limited', 'ops_override'))",
     # 5. The audit table is append-only; revoke DELETE from the API role. A
     #    REVOKE of a privilege that was never granted is a no-op, which is what
     #    makes the block safe to run against a database already in shape.
@@ -195,8 +195,12 @@ async def test_pre_migration_link_stops_working_and_resend_restores_it(
     fresh = await mailpit_token(messages[0]["ID"])
 
     ok = await raw_client.get(f"/api/verify?token={fresh}", follow_redirects=False)
-    assert "verified=1" in ok.headers["location"]
-    assert (await db.fetch_user(sid))["verified"] is True
+    # The click lands them in pending_relink, not verified -- clicking a link
+    # never sets verified any more.
+    assert "relinking=1" in ok.headers["location"]
+    user = await db.fetch_user(sid)
+    assert user["verified"] is False
+    assert user["relink_state"] == "pending_relink"
 
 
 async def test_migration_admits_the_new_audit_actions(migrated_schema):
@@ -206,7 +210,16 @@ async def test_migration_admits_the_new_audit_actions(migrated_schema):
     sid = new_sid()
     pool = await db.get_pool()
     async with pool.acquire() as conn:
-        for action in ("submit_email_collision", "rate_limited", "dismiss_modal"):
+        for action in (
+            "submit_email_collision", "rate_limited", "dismiss_modal",
+            # The ops override's action. It is in this list because the CHECK is
+            # the only thing standing between the override and a 500 on a
+            # database that was migrated before FOSS-13 -- the vocabulary lives
+            # in four places (postgres/init-databases.sh, the runbook's step 4,
+            # MIGRATION_SQL above, and here) and this is the assertion that
+            # notices when one of them is missed.
+            "ops_override",
+        ):
             await conn.execute(
                 "INSERT INTO foss_users_audit (synthetic_id, action) VALUES ($1, $2)",
                 sid, action,

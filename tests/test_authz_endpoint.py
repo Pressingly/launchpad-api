@@ -23,11 +23,13 @@ _SYNTH = settings.synthetic_email_domain
 # using the app pool fails with InsufficientPrivilegeError at teardown.
 
 
-async def _mk_verified(sid: str, email: str):
-    """Seed a verified user.
+async def _mk_relinked(sid: str, email: str):
+    """Seed a user whose relink is COMPLETE -- the only kind the gate lets
+    through.
 
-    Tokens are stored hashed, so both calls take a digest rather than the raw
-    value; db.hash_token is the same function the endpoints use.
+    Clicking the verification link no longer produces this state; it produces
+    pending_relink. Tokens are stored hashed, so the calls take a digest rather
+    than the raw value; db.hash_token is the same function the endpoints use.
     """
     from datetime import datetime
 
@@ -44,12 +46,34 @@ async def _mk_verified(sid: str, email: str):
         ip_address=None,
         user_agent=None,
     )
-    await db.mark_verified(token_hash, ip_address=None, user_agent=None)
+    assert await db.mark_pending_relink(token_hash, ip_address=None, user_agent=None) == sid
+    assert await db.mark_relinked(sid) is True
+
+
+async def _mk_pending_relink(sid: str, email: str):
+    """Seed a user held mid-relink: the link is clicked, the relink is not
+    done."""
+    from datetime import datetime
+
+    expires = datetime.now(timezone.utc) + timedelta(hours=24)
+    token_hash = db.hash_token("tok_" + sid)
+    await db.submit_email(
+        synthetic_id=sid,
+        email=email,
+        display_name="Jane",
+        token_hash=token_hash,
+        verification_expires=expires,
+        consent_text_version="test",
+        consent_text_content="test consent",
+        ip_address=None,
+        user_agent=None,
+    )
+    assert await db.mark_pending_relink(token_hash, ip_address=None, user_agent=None) == sid
 
 
 async def test_authz_allows_verified_real_email(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
-    await _mk_verified(sid, "jane@corp.com")
+    await _mk_relinked(sid, "jane@corp.com")
     gate._clear_cache()
     r = await client.get(
         "/api/authz",
@@ -96,7 +120,7 @@ async def test_authz_403_json_for_unverified_api_client(client, cleanup_test_use
 
 async def test_authz_refreshes_stale_synthetic_token(client, cleanup_test_users):
     sid = f"test_{secrets.token_hex(4)}"
-    await _mk_verified(sid, "jane@corp.com")  # verified in DB...
+    await _mk_relinked(sid, "jane@corp.com")  # verified in DB...
     gate._clear_cache()
     r = await client.get(
         "/api/authz",
@@ -127,7 +151,7 @@ async def test_authz_refuses_stale_token_for_api_client(client, cleanup_test_use
     let it create exactly the duplicate row this gate exists to prevent -- and
     MCP traffic crosses this gate, holding one token for its whole lifetime."""
     sid = f"test_{secrets.token_hex(4)}"
-    await _mk_verified(sid, "jane@corp.com")
+    await _mk_relinked(sid, "jane@corp.com")
     gate._clear_cache()
     r = await client.get(
         "/api/authz",
@@ -139,6 +163,91 @@ async def test_authz_refuses_stale_token_for_api_client(client, cleanup_test_use
     )
     assert r.status_code == 403
     assert r.json()["error"] == "email_refresh_required"
+
+
+async def test_authz_redirects_a_relinking_browser_to_the_relinking_panel(
+    client, cleanup_test_users
+):
+    """Held, not collected. Sending them to ?collect=1 shows the collection
+    form, which invites a resubmit that lands them right back here."""
+    sid = f"test_{secrets.token_hex(4)}"
+    await _mk_pending_relink(sid, f"relink-{secrets.token_hex(4)}@corp.com")
+    gate._clear_cache()
+    r = await client.get(
+        "/api/authz",
+        headers={
+            "X-Auth-Request-Preferred-Username": sid,
+            "X-Auth-Request-Email": f"{sid}@{_SYNTH}",
+            "Accept": "text/html",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code == 302
+    assert "/?relinking=1" in r.headers["location"]
+    assert "collect=1" not in r.headers["location"]
+
+
+async def test_authz_403_json_for_a_relinking_api_client(client, cleanup_test_users):
+    sid = f"test_{secrets.token_hex(4)}"
+    await _mk_pending_relink(sid, f"relink-{secrets.token_hex(4)}@corp.com")
+    gate._clear_cache()
+    r = await client.get(
+        "/api/authz",
+        headers={
+            "X-Auth-Request-Preferred-Username": sid,
+            "X-Auth-Request-Email": f"{sid}@{_SYNTH}",
+            "Accept": "application/json",
+        },
+    )
+    assert r.status_code == 403
+    assert r.json()["error"] == "relink_in_progress"
+
+
+async def test_authz_holds_a_relinking_user_even_with_a_real_email_claim(
+    client, cleanup_test_users
+):
+    """The population this gate exists for. If a token somehow already carried
+    the real address, letting them through is what creates the duplicate app
+    account -- so the hold is decided on state, never on the claim."""
+    sid = f"test_{secrets.token_hex(4)}"
+    await _mk_pending_relink(sid, f"relink-{secrets.token_hex(4)}@corp.com")
+    gate._clear_cache()
+    r = await client.get(
+        "/api/authz",
+        headers={
+            "X-Auth-Request-Preferred-Username": sid,
+            "X-Auth-Request-Email": "jane@corp.com",
+            "Accept": "text/html",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code == 302
+    assert "/?relinking=1" in r.headers["location"]
+
+
+async def test_authz_allows_the_legacy_verified_combination(
+    client, cleanup_test_users
+):
+    """verified = true, relink_state = 'none': verified before the column
+    existed. Holding them would lock out accounts that predate the feature."""
+    sid = f"test_{secrets.token_hex(4)}"
+    await _mk_relinked(sid, "legacy@corp.com")
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET relink_state = 'none' WHERE synthetic_id = $1",
+            sid,
+        )
+    gate._clear_cache()
+    r = await client.get(
+        "/api/authz",
+        headers={
+            "X-Auth-Request-Preferred-Username": sid,
+            "X-Auth-Request-Email": "legacy@corp.com",
+            "Accept": "text/html",
+        },
+    )
+    assert r.status_code == 200
 
 
 async def test_authz_503s_when_synthetic_domain_is_unset(client, monkeypatch):
