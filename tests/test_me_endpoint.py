@@ -61,7 +61,15 @@ async def test_me_returns_relink_failed(client, cleanup_test_users):
     assert await db.mark_pending_relink(
         db.hash_token("tok_relink_failed"), None, None
     ) == sid
-    assert await db.mark_relink_failed(sid, "collision with another account") is True
+    # Direct UPDATE, not a db.py helper: the runner owns this transition and
+    # lives in its own image, so launchpad-api has no function for it.
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET relink_state = 'relink_failed', "
+            "relink_error = $2 WHERE synthetic_id = $1",
+            sid, "collision with another account",
+        )
 
     response = await client.get(
         "/api/me",
