@@ -36,7 +36,7 @@ other and the runbook table with it.
 
 Re-queueing a `relink_failed` user
 -----------------------------------
-Under `runner` mode, a relink script exiting 2 (a collision only a human can
+Under `runner` mode, a relink script exiting 2 (a collision a human must
 resolve) sets `relink_state = 'relink_failed'`; the runner will not retry it.
 There is no separate flag for putting that user back in the queue: once an
 operator has resolved the collision by hand, the ordinary `runner`-mode
@@ -328,7 +328,7 @@ async def run_override(
 
     # `relink_state == "pending_relink"` above is an exact match, deliberately
     # not "already enqueued in some sense": a `relink_failed` row (the runner
-    # hit a collision only a human can resolve) does NOT match it, so it never
+    # hit a collision, or a script that kept failing) does NOT match it, so it never
     # takes this no-op branch. That is what makes re-queueing work below --
     # there is no new flag for it. Once the operator has resolved the
     # collision by hand (freeing the address `verified_owner` checks above),
