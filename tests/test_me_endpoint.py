@@ -52,6 +52,31 @@ async def test_me_returns_relinking_after_the_link_is_clicked(
     assert body["email"] == "jane@example.com"
 
 
+async def test_me_returns_relink_failed(client, cleanup_test_users):
+    """A relink the runner refused. Distinct from 'relinking' so the portal can
+    tell the user an administrator has been notified, rather than "still
+    working on it"."""
+    sid = f"test_{secrets.token_hex(4)}"
+    await seed_pending(sid, "jane@example.com", "tok_relink_failed")
+    assert await db.mark_pending_relink(
+        db.hash_token("tok_relink_failed"), None, None
+    ) == sid
+    assert await db.mark_relink_failed(sid, "collision with another account") is True
+
+    response = await client.get(
+        "/api/me",
+        headers={"X-Auth-Request-Preferred-Username": f"{sid}"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "relink_failed"
+    assert body["email"] == "jane@example.com"
+    # The refusal detail can name another account's address -- not the
+    # caller's business, so it must never appear in this response.
+    assert "relink_error" not in body
+    assert "collision" not in response.text
+
+
 async def test_me_returns_verified_once_the_relink_completes(
     client, cleanup_test_users
 ):

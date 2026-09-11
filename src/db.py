@@ -99,7 +99,7 @@ async def fetch_user(synthetic_id: str) -> Optional[dict]:
         row = await conn.fetchrow(
             """
             SELECT synthetic_id, real_email, display_name, verified,
-                   relink_state,
+                   relink_state, relink_error,
                    verification_token, verification_expires,
                    verified_at, created_at, updated_at
             FROM foss_users WHERE synthetic_id = $1
@@ -403,6 +403,13 @@ async def mark_relinked(synthetic_id: str) -> bool:
                     UPDATE foss_users
                     SET verified = TRUE,
                         relink_state = 'relinked',
+                        -- Cleared unconditionally. A prior refusal recorded here
+                        -- is now stale the moment the relink completes -- by any
+                        -- path, including a retry after the runner or an
+                        -- operator resolved the collision -- and a lingering
+                        -- value would misreport a completed user as failed to
+                        -- anything that reads the column directly.
+                        relink_error = NULL,
                         verification_token = NULL,
                         verification_expires = NULL,
                         verified_at = COALESCE(verified_at, now()),
@@ -467,6 +474,97 @@ async def mark_relinked(synthetic_id: str) -> bool:
         # No audit row here. foss_users_audit's action vocabulary is a CHECK
         # constraint; the ops override is the caller that wants an actor
         # recorded, and it writes its own ops_override row.
+        return True
+
+
+async def next_pending_relink() -> Optional[dict]:
+    """The oldest row still queued for the relink runner, or None.
+
+    Selects on `relink_state = 'pending_relink' AND verified = FALSE` --
+    ops_override_write documents why the runner must not loosen this: a
+    verified row in pending_relink means the address is already live, and
+    relinking app accounts onto it would move them to an address they were
+    never keyed to.
+
+    Ordered by `updated_at`, which every write to a row bumps -- so it tracks
+    queue-entry time, and a row that mark_relink_failed sends back through the
+    queue (were it ever requeued) would sort to the back rather than jump
+    ahead of rows still waiting on their first attempt.
+
+    Returns a dict with at least synthetic_id and real_email. The caller of
+    this function must only pass the synthetic_id it got back here to
+    mark_relinked or mark_relink_failed -- it is the runner's claim that the
+    row is the one it is currently working, not a guarantee that stays true if
+    the runner races itself.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT synthetic_id, real_email, display_name
+            FROM foss_users
+            WHERE relink_state = 'pending_relink' AND verified = FALSE
+            ORDER BY updated_at ASC
+            LIMIT 1
+            """
+        )
+    return dict(row) if row else None
+
+
+async def mark_relink_failed(synthetic_id: str, error: str) -> bool:
+    """Record a relink the runner could not complete.
+
+    A script exiting 2 means a collision only a human can resolve -- two
+    accounts, and merging them is a human decision. Under `manual` an operator
+    absorbed that by simply not completing the user. Under `runner` nobody
+    does unless something moves the row out of `pending_relink`: left there it
+    is indistinguishable from "not yet picked up" and the runner would re-claim
+    it forever while the user waits at the modal.
+
+    Returns False when there is no such row (mirrors mark_relinked's shape).
+
+    No state guard on the UPDATE, unlike mark_relinked: this function has no
+    caller yet other than the runner being built alongside this change, and it
+    must only be called with a synthetic_id the caller just claimed from
+    next_pending_relink -- never on an arbitrary sid.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                UPDATE foss_users
+                SET relink_state = 'relink_failed',
+                    relink_error = $2,
+                    updated_at = now()
+                WHERE synthetic_id = $1
+                RETURNING synthetic_id
+                """,
+                synthetic_id, error,
+            )
+            if row is None:
+                return False
+
+            await _insert_audit(
+                conn,
+                synthetic_id=synthetic_id,
+                action="relink",
+                email=None,
+                consent_text_version=None,
+                consent_text_content=None,
+                ip_address=None,
+                # Structured string, the convention ops_override.py's
+                # _audit_note already uses -- no new detail column for this.
+                user_agent=f"relink runner; refused: {error}",
+            )
+
+        # Same reason mark_relinked evicts after its transaction commits: the
+        # memo holds relink_state, so a runner that does not evict leaves the
+        # gate handing out the pre-failure answer for up to the TTL. Today that
+        # answer (RELINKING) happens to be the same either way, but the
+        # invariant mark_relinked documents is unconditional on purpose.
+        from src import gate as _gate
+        _gate.evict(synthetic_id)
         return True
 
 

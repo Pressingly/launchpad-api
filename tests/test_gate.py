@@ -52,6 +52,26 @@ def test_pending_relink_is_held_before_the_verified_branch():
     ) is GateAction.RELINKING
 
 
+def test_relink_failed_is_held():
+    """A refused relink must not fall through to COLLECT: resubmitting only
+    issues another verification link and walks the user back into the same
+    refusal -- the loop this gate exists to prevent."""
+    assert decide_gate(
+        verified=False, relink_state="relink_failed",
+        email="sid1@askii.ai", sid="sid1", synthetic_domain="askii.ai"
+    ) is GateAction.RELINKING
+
+
+def test_relink_failed_is_held_before_the_verified_branch():
+    """Same ordering guard as pending_relink: ops_override_write's ON CONFLICT
+    preserves `verified` while setting relink_state, so (verified=TRUE,
+    relink_state='relink_failed') is reachable and must still be held."""
+    assert decide_gate(
+        verified=True, relink_state="relink_failed",
+        email="jane@corp.com", sid="sid1", synthetic_domain="askii.ai"
+    ) is GateAction.RELINKING
+
+
 def test_the_legacy_combination_is_treated_as_complete():
     """verified = true with relink_state = 'none' is a user who verified before
     the column existed. Holding them would lock out test accounts the moment

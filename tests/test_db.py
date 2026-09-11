@@ -23,7 +23,9 @@ from src.db import (
     hash_token,
     insert_audit,
     mark_pending_relink,
+    mark_relink_failed,
     mark_relinked,
+    next_pending_relink,
     rotate_verification_token,
     submit_email,
 )
@@ -346,6 +348,103 @@ async def test_mark_relinked_completes_a_legacy_verified_row(cleanup_test_users)
 
     assert await mark_relinked(sid) is True
     assert await _state(sid) == "relinked"
+
+
+async def test_next_pending_relink_returns_the_oldest_queued_row(cleanup_test_users):
+    """Oldest first, ordered on updated_at rather than insertion order -- a
+    tie on now() is possible within one transaction, so the timestamps are set
+    explicitly rather than relying on call order."""
+    older, newer = _sid(), _sid()
+    await _submit(older, _email(), "tok-older")
+    await mark_pending_relink(hash_token("tok-older"), None, None)
+    await _submit(newer, _email(), "tok-newer")
+    await mark_pending_relink(hash_token("tok-newer"), None, None)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET updated_at = now() - interval '1 hour' "
+            "WHERE synthetic_id = $1",
+            older,
+        )
+
+    # Defensive against a non-empty queue (a shared or non-fresh database):
+    # assert relative ordering rather than that `older` is THE row returned.
+    row = await next_pending_relink()
+    assert row is not None
+    assert row["synthetic_id"] != newer
+
+
+async def test_next_pending_relink_excludes_verified_rows(cleanup_test_users):
+    """The constraint ops_override_write documents: a verified row in
+    pending_relink means the address is already live, and relinking app
+    accounts onto it would move them to an address they were never keyed to."""
+    sid = _sid()
+    await _submit(sid, _email(), "tok-verified-pending")
+    await mark_pending_relink(hash_token("tok-verified-pending"), None, None)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET verified = TRUE WHERE synthetic_id = $1", sid
+        )
+
+    row = await next_pending_relink()
+    assert row is None or row["synthetic_id"] != sid
+
+
+async def test_mark_relink_failed_sets_both_columns_and_writes_audit(
+    cleanup_test_users,
+):
+    sid = _sid()
+    await _submit(sid, _email(), "tok-fail")
+    await mark_pending_relink(hash_token("tok-fail"), None, None)
+
+    assert await mark_relink_failed(sid, "collision with test_other_sid") is True
+
+    user = await fetch_user(sid)
+    assert user["relink_state"] == "relink_failed"
+    assert user["relink_error"] == "collision with test_other_sid"
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT action, user_agent FROM foss_users_audit "
+            "WHERE synthetic_id = $1 AND action = 'relink'",
+            sid,
+        )
+    assert len(rows) == 1
+    assert "collision with test_other_sid" in rows[0]["user_agent"]
+
+
+async def test_mark_relink_failed_returns_false_for_an_unknown_user(
+    cleanup_test_users,
+):
+    assert await mark_relink_failed("test_no_such_user_xyz", "whatever") is False
+
+
+async def test_mark_relinked_clears_relink_error(cleanup_test_users):
+    """A stale refusal must not survive a completed relink -- otherwise a user
+    who is done reads as failed to anything that looks at the column
+    directly."""
+    sid = _sid()
+    await _submit(sid, _email(), "tok-recover")
+    await mark_pending_relink(hash_token("tok-recover"), None, None)
+    await mark_relink_failed(sid, "temporary collision")
+    assert (await fetch_user(sid))["relink_error"] is not None
+
+    # Re-queue the way an operator or the runner would, then complete it.
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET relink_state = 'pending_relink' "
+            "WHERE synthetic_id = $1",
+            sid,
+        )
+    assert await mark_relinked(sid) is True
+
+    user = await fetch_user(sid)
+    assert user["relink_state"] == "relinked"
+    assert user["relink_error"] is None
 
 
 async def test_resubmitting_clears_a_pending_relink(cleanup_test_users):
