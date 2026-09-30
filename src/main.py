@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from src import consent_text, db, rate_limit
 from src.gate import GateAction, decide_gate, verified_state
 from src.gate import evict as gate_evict
-from src.config import settings
+from src.config import RELINK_SKIP, settings
 from src.models import EmailSubmitRequest, UserStateResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -547,6 +547,9 @@ async def verify_email(token: str, request: Request):
     # renders nothing to explain why.
     gate_evict(sid)
 
+    if settings.launchpad_relink_runner == RELINK_SKIP:
+        return await _complete_without_relink(sid, portal)
+
     # ?relinking=1, not ?verified=1. The portal treats ?verified=1 as "your
     # address is live now" and fires a full /oauth2/sign_in round-trip to remint
     # the session so the apps see the new claim. After this change the claim has
@@ -555,6 +558,24 @@ async def verify_email(token: str, request: Request):
     # user back on the portal a redirect later. ?relinking=1 renders the panel
     # that says what is actually happening.
     return RedirectResponse(url=f"{portal}?relinking=1", status_code=302)
+
+
+async def _complete_without_relink(sid: str, portal: str) -> RedirectResponse:
+    """RELINK_SKIP: there are no app accounts to move, so complete the user now.
+
+    mark_relinked keeps its guards (it only completes a row that proved control
+    of the address) and is where the verified-address unique index fires, so a
+    race with another account verifying the same address lands in email_taken
+    and leaves this user in pending_relink for an operator, as under `manual`.
+    ?verified=1 makes the portal re-run sign-in, so the apps get the verified
+    address in the identity claims straight away.
+    """
+    try:
+        await db.mark_relinked(sid)
+    except db.EmailAlreadyRegistered:
+        logger.info("verify: address verified by another account before completion")
+        return RedirectResponse(url=f"{portal}?verify_error=email_taken", status_code=302)
+    return RedirectResponse(url=f"{portal}?verified=1", status_code=302)
 
 
 @app.post("/api/email/resend")

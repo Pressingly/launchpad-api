@@ -51,10 +51,19 @@ full contract with defaults. The ones a deployment must set:
   points at.
 - `SMTP_*`, `FROM_ADDRESS`, `FROM_NAME`: the mail relay.
 - `REDIS_URL`: the rate limiter's store (the bundle uses Valkey DB 11).
-- `LAUNCHPAD_RELINK_RUNNER`: `manual` wherever users already hold app accounts
-  under their synthetic address; an operator relinks them with the ops override
-  CLI, which refuses while this is empty. `runner` exists only for Moneta's
-  retiring relink-runner, which is not part of this repository.
+- `LAUNCHPAD_RELINK_RUNNER`: what happens after a user clicks the verification
+  link.
+  - `skip`: the user is completed at once and signed in again with the verified
+    address. For installs where nobody has app accounts under their synthetic
+    address, because the verify-gate was on from their first login. Relink any
+    older accounts with the ops override **before** turning the gate on, or they
+    are duplicated.
+  - `manual`: the user is held until an operator relinks their app accounts and
+    completes them with the ops override CLI. For installs whose users already
+    hold app accounts under their synthetic address.
+  - `runner`: exists only for Moneta's retiring relink-runner, which is not part
+    of this repository.
+  - Empty: nothing completes a user, and the ops override refuses.
 
 ## Database
 

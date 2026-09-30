@@ -27,6 +27,8 @@ instead. A code comment does not cover that, so the behaviour is:
 
     (empty)   refuse -- no mechanism exists to relink anything
     manual    require --relink-done; the operator asserts they relinked by hand
+    skip      same as manual: /api/verify completes new users itself, and this
+              command is for accounts that predate the verify-gate
     runner    enqueue (relink_state = 'pending_relink'); the runner completes it
     anything else   refuse -- exact, case-sensitive match, same as platform.sh
 
@@ -65,14 +67,16 @@ from typing import Optional
 from pydantic import BaseModel, EmailStr, ValidationError
 
 from src import db
-from src.config import settings
+from src.config import RELINK_SKIP, settings
 from src.gate import is_relink_complete
 
 # The two values that mean a relink can happen. Exact, case-sensitive; see the
 # module docstring and platform.sh's _validate_launchpad_switch.
 RUNNER_MANUAL = "manual"
 RUNNER_RUNNER = "runner"
-VALID_RUNNERS = (RUNNER_MANUAL, RUNNER_RUNNER)
+VALID_RUNNERS = (RUNNER_MANUAL, RUNNER_RUNNER, RELINK_SKIP)
+# Modes where the operator completes the relink on their own assertion.
+OPERATOR_ASSERTED = (RUNNER_MANUAL, RELINK_SKIP)
 
 # Printed before a `manual` override is applied, and again (as the reason for
 # refusing) when --relink-done is missing. One string, so the operator cannot be
@@ -142,7 +146,7 @@ def _audit_note(operator: str, mode: str, reason: str) -> str:
     was given -- see db.ops_override_write for why writing an operator's
     justification into the consent artifact is not an option.
     """
-    if mode == RUNNER_MANUAL:
+    if mode in OPERATOR_ASSERTED:
         authority = (
             "relink asserted by operator via --relink-done, NOT verified by the "
             "platform"
@@ -207,14 +211,14 @@ async def run_override(
     if mode not in VALID_RUNNERS:
         raise OverrideRefused(
             f"LAUNCHPAD_RELINK_RUNNER is set to {mode!r}, which is not a value "
-            "this platform understands. It must be exactly 'manual' or "
-            "'runner' -- the match is case-sensitive -- or empty for neither. "
+            "this platform understands. It must be exactly 'manual', 'runner' or "
+            "'skip' -- the match is case-sensitive -- or empty for none. "
             "Fix it in .env. See dev/docs/launchpad-runbook.md."
         )
 
-    if mode == RUNNER_MANUAL and not relink_done:
+    if mode in OPERATOR_ASSERTED and not relink_done:
         raise OverrideRefused(
-            "LAUNCHPAD_RELINK_RUNNER=manual, so this override completes the "
+            f"LAUNCHPAD_RELINK_RUNNER={mode}, so this override completes the "
             "user's relink and requires --relink-done.\n\n"
             f"{ASSERTION}\n\n"
             "Do the per-app relink first, then re-run with --relink-done."
