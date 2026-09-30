@@ -11,7 +11,7 @@
 -- `mpass_auth_user` with non-empty passwords. See the README.
 --
 -- Two roles connect:
---   launchpad_api_user   read+write (launchpad-api, relink-runner)
+--   launchpad_api_user   read+write, used by launchpad-api
 --   mpass_auth_user      read-only on three columns of foss_users, used by
 --                        mpass-auth-proxy. It deliberately cannot read
 --                        verification_token; see the GRANT at the bottom.

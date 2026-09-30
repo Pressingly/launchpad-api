@@ -51,9 +51,10 @@ full contract with defaults. The ones a deployment must set:
   points at.
 - `SMTP_*`, `FROM_ADDRESS`, `FROM_NAME`: the mail relay.
 - `REDIS_URL`: the rate limiter's store (the bundle uses Valkey DB 11).
-- `LAUNCHPAD_RELINK_RUNNER`: `manual` or `runner` wherever users already hold app
-  accounts under their synthetic address. The ops override CLI refuses while it
-  is empty.
+- `LAUNCHPAD_RELINK_RUNNER`: `manual` wherever users already hold app accounts
+  under their synthetic address; an operator relinks them with the ops override
+  CLI, which refuses while this is empty. `runner` exists only for Moneta's
+  retiring relink-runner, which is not part of this repository.
 
 ## Database
 
