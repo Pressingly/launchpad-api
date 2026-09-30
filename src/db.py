@@ -308,6 +308,9 @@ _CONSUME_TOKEN_HOLD = """
 
 # RELINK_SKIP only. The token check stands in for mark_relinked's state guard:
 # the row is completed only by the click that proves control of the address.
+# relink_state = 'none' keeps a user an operator is holding (pending_relink,
+# relink_failed) from completing themselves through a resend; a fresh
+# submission always starts from 'none'.
 _CONSUME_TOKEN_COMPLETE = """
     UPDATE foss_users
     SET verified = TRUE,
@@ -319,6 +322,7 @@ _CONSUME_TOKEN_COMPLETE = """
         updated_at = now()
     WHERE verification_token = $1
       AND verification_expires > now()
+      AND relink_state = 'none'
     RETURNING synthetic_id, real_email
 """
 
@@ -353,8 +357,10 @@ async def _consume_verification_token(
             try:
                 row = await conn.fetchrow(update_sql, token_hash)
             except asyncpg.UniqueViolationError as exc:
-                # Only reachable when completing: the probe below lost a race
-                # and the verified-address index fired on this UPDATE.
+                # Only reachable when completing: that UPDATE sets verified, so
+                # the verified-address index is the check on the completing
+                # path, and fires before the probe below whenever another
+                # account has the address. The probe is the hold path's check.
                 if exc.constraint_name != "idx_foss_users_email":
                     raise
                 raise EmailAlreadyRegistered() from exc

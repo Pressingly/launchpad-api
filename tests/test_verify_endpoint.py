@@ -182,3 +182,22 @@ async def test_skip_mode_leaves_an_expired_token_unconsumed(
 
     assert "verify_error=expired_or_invalid" in response.headers["location"]
     assert (await db.fetch_user(sid))["verified"] is False
+
+
+async def test_skip_mode_does_not_complete_a_user_an_operator_is_holding(
+    client, cleanup_test_users, admin_conn, monkeypatch
+):
+    """A user parked in pending_relink (relink not done yet) who gets a fresh
+    link through resend must not complete themselves once skip is on."""
+    monkeypatch.setattr(settings, "launchpad_relink_runner", RELINK_SKIP)
+    sid = f"test_{secrets.token_hex(4)}"
+    await seed_pending(sid, f"jane-{secrets.token_hex(4)}@example.com", "heldtok")
+    await admin_conn.execute(
+        "UPDATE foss_users SET relink_state = 'pending_relink' WHERE synthetic_id = $1", sid
+    )
+
+    response = await client.get("/api/verify?token=heldtok", follow_redirects=False)
+
+    assert "verify_error=expired_or_invalid" in response.headers["location"]
+    assert (await db.fetch_user(sid))["verified"] is False
+    assert await relink_state(sid) == "pending_relink"

@@ -525,9 +525,9 @@ async def verify_email(token: str, request: Request):
     try:
         # NOT mark_verified -- that function is gone. Clicking the link proves
         # the user controls the address; it does not move their five app
-        # accounts onto it. Setting verified here is what made every app create
-        # a second account, so the click now only moves them to pending_relink
-        # and the relink sets verified.
+        # accounts onto it. Under manual and runner the click therefore only
+        # moves them to pending_relink and the relink sets verified. Only under
+        # skip, where there are no accounts to move, does the click complete.
         sid = await consume(
             token_hash=db.hash_token(token),
             ip_address=_client_ip(request),
