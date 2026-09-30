@@ -5,7 +5,10 @@
 -- image, or by hand:
 --
 --   LAUNCHPAD_DB_PASSWORD=... LAUNCHPAD_MPASS_DB_PASSWORD=... \
---     psql "$SUPERUSER_DSN" -f sql/bootstrap.sql
+--     psql "postgresql://postgres:<pw>@<host>:5432/postgres" -f sql/bootstrap.sql
+--
+-- Connect to the maintenance database, since `launchpad` does not exist on the
+-- first run. Needs psql 15 or later for \getenv.
 --
 -- Idempotent: re-running creates what is missing and resets both passwords to
 -- the values given, so the cluster is reconciled with the deployment's secrets.

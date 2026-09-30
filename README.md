@@ -67,8 +67,11 @@ Two steps, in this order, on every deploy. Both are idempotent.
 
    ```bash
    LAUNCHPAD_DB_PASSWORD=... LAUNCHPAD_MPASS_DB_PASSWORD=... \
-     psql "$SUPERUSER_DSN" -f sql/bootstrap.sql
+     psql "postgresql://postgres:<pw>@<host>:5432/postgres" -f sql/bootstrap.sql
    ```
+
+   The DSN must name the maintenance database (`postgres`), since `launchpad`
+   does not exist on the first run. Needs psql 15 or later (`\getenv`).
 
    Where the platform manages roles itself (for example CloudNativePG managed
    roles), create the same database, roles and `CONNECT` grant there instead.
@@ -76,12 +79,21 @@ Two steps, in this order, on every deploy. Both are idempotent.
 2. **Schema (from the image).** Applies [sql/schema.sql](sql/schema.sql) in one
    transaction: tables, constraints, indexes and grants, including upgrades of
    older databases. It refuses, without changing anything, when existing rows
-   would violate a constraint.
+   would violate a constraint, when connected to a database other than
+   `DB_NAME` (default `launchpad`), or when either role is missing. Concurrent
+   runs wait on an advisory lock, and a run gives up after 10 seconds waiting
+   for a table lock rather than stall logins.
 
    ```bash
-   docker run --rm -e MIGRATE_DATABASE_URL=postgresql://<owner>:<pw>@<host>:5432/launchpad \
+   docker run --rm -e MIGRATE_DATABASE_URL=postgresql://<role>:<pw>@<host>:5432/launchpad \
      <image> python -m src.migrate
    ```
+
+   `MIGRATE_DATABASE_URL` is read only by this command, never by the service.
+   The role must own the launchpad tables (on a fresh database, the database
+   owner) or be a superuser, and should be the same role on every run:
+   `ALTER TABLE` needs ownership. Databases built by foss-server-bundle have
+   tables owned by `postgres`.
 
    In Kubernetes this is a Job or an init container running the same image
    with `command: ["python", "-m", "src.migrate"]`.

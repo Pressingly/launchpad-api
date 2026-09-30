@@ -17,6 +17,16 @@
 --                        verification_token; see the GRANT at the bottom.
 -- =============================================================================
 
+-- Serialize concurrent runs (several pods starting at once). Without this, two
+-- transactions holding the pre-flight's share locks deadlock when each upgrades
+-- to the exclusive lock the constraint ALTERs need.
+SELECT pg_advisory_xact_lock(hashtext('launchpad-api:schema'));
+
+-- The ALTERs below take an exclusive lock on foss_users, which mpass-auth-proxy
+-- reads on every token exchange. Give up quickly rather than queue logins
+-- behind a long-running transaction.
+SET LOCAL lock_timeout = '10s';
+
 -- -----------------------------------------------------------------------------
 -- Pre-flight: everything that can refuse runs before the first mutation, so the
 -- message can name the offending values.
