@@ -68,7 +68,12 @@ def main() -> int:
         print(f"migrate: {DSN_ENV} is required.", file=sys.stderr)
         return 2
     try:
-        asyncio.run(apply_schema(dsn, SCHEMA_PATH.read_text()))
+        schema_sql = SCHEMA_PATH.read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"migrate: cannot read {SCHEMA_PATH} ({type(exc).__name__}).", file=sys.stderr)
+        return 1
+    try:
+        asyncio.run(apply_schema(dsn, schema_sql))
     except MigrationRefused as exc:
         print(f"migrate: {exc} No schema change was made.", file=sys.stderr)
         return 1
