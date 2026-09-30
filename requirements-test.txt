@@ -1,5 +1,5 @@
 # Test-only dependencies. Kept out of requirements.txt so the runtime image
-# (launchpad-api/Dockerfile installs requirements.txt only) does not ship the
+# (the Dockerfile installs requirements.txt only) does not ship the
 # test toolchain. Mirrors mpass-auth-proxy's layout.
 #
 # httpx is test-only: nothing under src/ imports it. It is used by

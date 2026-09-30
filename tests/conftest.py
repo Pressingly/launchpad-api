@@ -103,7 +103,7 @@ async def cleanup_test_users(admin_conn):
     Two connections, on purpose. `foss_users` is cleaned through the ordinary
     pool because `launchpad_api_user` legitimately holds DELETE there. The audit
     table does not grant DELETE to that role -- it is an append-only action
-    history (see postgres/init-databases.sh) -- so its cleanup goes over the
+    history (see sql/schema.sql) -- so its cleanup goes over the
     superuser `admin_conn`. Doing this the other way round is what a test fixture
     should never do: it would make the suite depend on a privilege the
     application is not supposed to have, and quietly re-open it the moment

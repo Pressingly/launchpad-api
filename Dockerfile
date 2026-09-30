@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 COPY templates/ ./templates/
+COPY sql/ ./sql/
 
 # Drop root. The service writes nothing to disk -- it talks to Postgres, Valkey
 # and SMTP -- so it needs no ownership changes: /app is root-owned and
@@ -16,7 +17,7 @@ COPY templates/ ./templates/
 #
 # The base tag stays `python:3.11-slim` rather than a digest on purpose. A minor
 # version is already a pin; digest-pinning an image that receives security
-# patches means a PR per patch, and .github/workflows/launchpad-tests.yml pins
+# patches means a PR per patch, and .github/workflows/tests.yml pins
 # its job container to `python:3.11-slim` to match this line -- a digest here
 # would make that comment untrue.
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin launchpad
