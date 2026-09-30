@@ -51,10 +51,22 @@ full contract with defaults. The ones a deployment must set:
   points at.
 - `SMTP_*`, `FROM_ADDRESS`, `FROM_NAME`: the mail relay.
 - `REDIS_URL`: the rate limiter's store (the bundle uses Valkey DB 11).
-- `LAUNCHPAD_RELINK_RUNNER`: `manual` wherever users already hold app accounts
-  under their synthetic address; an operator relinks them with the ops override
-  CLI, which refuses while this is empty. `runner` exists only for Moneta's
-  retiring relink-runner, which is not part of this repository.
+- `LAUNCHPAD_RELINK_RUNNER`: what happens after a user clicks the verification
+  link.
+  - `skip`: the user is completed at once and signed in again with the verified
+    address. Only for installs where nobody holds an app account under their
+    synthetic address, because the verify-gate was on from their first login.
+    Users who used the apps before the gate must be relinked with the ops
+    override before they can verify, or every app creates a second account for
+    them. When switching an install from `manual` to `skip`, complete any users
+    still in `pending_relink` with the override first; nothing completes them
+    under `skip`. foss-server-bundle's `platform.sh` does not accept `skip` yet.
+  - `manual`: the user is held until an operator relinks their app accounts and
+    completes them with the ops override CLI. For installs whose users already
+    hold app accounts under their synthetic address.
+  - `runner`: exists only for Moneta's retiring relink-runner, which is not part
+    of this repository.
+  - Empty: nothing completes a user, and the ops override refuses.
 
 ## Database
 

@@ -295,6 +295,95 @@ async def submit_email(
     return _collision
 
 
+_CONSUME_TOKEN_HOLD = """
+    UPDATE foss_users
+    SET relink_state = 'pending_relink',
+        verification_token = NULL,
+        verification_expires = NULL,
+        updated_at = now()
+    WHERE verification_token = $1
+      AND verification_expires > now()
+    RETURNING synthetic_id, real_email
+"""
+
+# RELINK_SKIP only. The token check stands in for mark_relinked's state guard:
+# the row is completed only by the click that proves control of the address.
+# relink_state = 'none' keeps a user an operator is holding (pending_relink,
+# relink_failed) from completing themselves through a resend; a fresh
+# submission always starts from 'none'.
+_CONSUME_TOKEN_COMPLETE = """
+    UPDATE foss_users
+    SET verified = TRUE,
+        relink_state = 'relinked',
+        relink_error = NULL,
+        verification_token = NULL,
+        verification_expires = NULL,
+        verified_at = COALESCE(verified_at, now()),
+        updated_at = now()
+    WHERE verification_token = $1
+      AND verification_expires > now()
+      AND relink_state = 'none'
+    RETURNING synthetic_id, real_email
+"""
+
+
+async def _address_taken(conn: asyncpg.Connection, email: str, synthetic_id: str) -> bool:
+    # lower(), matching idx_foss_users_email, for the reason spelled out in
+    # submit_email: EmailStr normalises only the domain, so a case-sensitive
+    # probe misses exactly the duplicates that index exists to catch.
+    return bool(await conn.fetchval(
+        """
+        SELECT TRUE FROM foss_users
+        WHERE lower(real_email) = lower($1)
+          AND verified = TRUE AND synthetic_id <> $2
+        LIMIT 1
+        """,
+        email, synthetic_id,
+    ))
+
+
+async def _consume_verification_token(
+    update_sql: str,
+    token_hash: str,
+    ip_address: Optional[str],
+    user_agent: Optional[str],
+) -> Optional[str]:
+    """Consume the token, refuse a taken address and write the audit row, all in
+    one transaction. Any refusal rolls the token consumption back, so the user
+    keeps a link that still works and is never stranded token-less."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            try:
+                row = await conn.fetchrow(update_sql, token_hash)
+            except asyncpg.UniqueViolationError as exc:
+                # Only reachable when completing: that UPDATE sets verified, so
+                # the verified-address index is the check on the completing
+                # path, and fires before the probe below whenever another
+                # account has the address. The probe is the hold path's check.
+                if exc.constraint_name != "idx_foss_users_email":
+                    raise
+                raise EmailAlreadyRegistered() from exc
+
+            if row is None:
+                return None
+
+            if await _address_taken(conn, row["real_email"], row["synthetic_id"]):
+                raise EmailAlreadyRegistered(row["real_email"])
+
+            await _insert_audit(
+                conn,
+                synthetic_id=row["synthetic_id"],
+                action="verify_email",
+                email=None,
+                consent_text_version=None,
+                consent_text_content=None,
+                ip_address=ip_address,
+                user_agent=user_agent,
+            )
+            return row["synthetic_id"]
+
+
 async def mark_pending_relink(
     token_hash: str,
     ip_address: Optional[str],
@@ -321,57 +410,34 @@ async def mark_pending_relink(
 
     The audit write shares the transaction, for the same reason as submit_email.
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                """
-                UPDATE foss_users
-                SET relink_state = 'pending_relink',
-                    verification_token = NULL,
-                    verification_expires = NULL,
-                    updated_at = now()
-                WHERE verification_token = $1
-                  AND verification_expires > now()
-                RETURNING synthetic_id, real_email
-                """,
-                token_hash,
-            )
+    return await _consume_verification_token(
+        _CONSUME_TOKEN_HOLD, token_hash, ip_address, user_agent
+    )
 
-            if row is None:
-                return None
 
-            # lower(), matching idx_foss_users_email, for the reason spelled out
-            # in submit_email: EmailStr normalises only the domain, so a
-            # case-sensitive probe misses exactly the duplicates that index
-            # exists to catch.
-            taken = await conn.fetchval(
-                """
-                SELECT TRUE FROM foss_users
-                WHERE lower(real_email) = lower($1)
-                  AND verified = TRUE AND synthetic_id <> $2
-                LIMIT 1
-                """,
-                row["real_email"], row["synthetic_id"],
-            )
-            if taken:
-                # Roll the token consumption back with the exception: the user
-                # has not verified anything, and leaving them token-less in
-                # relink_state = 'none' would make "Resend" their only route
-                # out of a state they cannot resolve anyway.
-                raise EmailAlreadyRegistered(row["real_email"])
+async def verify_and_complete(
+    token_hash: str,
+    ip_address: Optional[str],
+    user_agent: Optional[str],
+) -> Optional[str]:
+    """RELINK_SKIP: consume the token and complete the user in one transaction.
 
-            await _insert_audit(
-                conn,
-                synthetic_id=row["synthetic_id"],
-                action="verify_email",
-                email=None,
-                consent_text_version=None,
-                consent_text_content=None,
-                ip_address=ip_address,
-                user_agent=user_agent,
-            )
-            return row["synthetic_id"]
+    The second place verified becomes true, and only for installs that declared
+    there is nothing to relink (LAUNCHPAD_RELINK_RUNNER=skip). Everywhere else
+    mark_relinked stays the only one. One transaction, so a failure part-way
+    leaves the user with their token and never token-less in pending_relink,
+    which nothing would ever complete under skip.
+
+    Returns synthetic_id, or None when the token is invalid or expired. Raises
+    EmailAlreadyRegistered when another account has verified the address.
+    """
+    synthetic_id = await _consume_verification_token(
+        _CONSUME_TOKEN_COMPLETE, token_hash, ip_address, user_agent
+    )
+    if synthetic_id is not None:
+        from src import gate as _gate
+        _gate.evict(synthetic_id)
+    return synthetic_id
 
 
 async def mark_relinked(synthetic_id: str) -> bool:
@@ -382,8 +448,9 @@ async def mark_relinked(synthetic_id: str) -> bool:
     keeps its original value), so an operator or a runner can retry without
     having to know whether the previous attempt got through.
 
-    **This is the only place verified becomes true.** mark_verified used to do
-    it from /api/verify; it is deleted rather than kept as an alias precisely
+    **This is the only place verified becomes true**, except verify_and_complete
+    under LAUNCHPAD_RELINK_RUNNER=skip, where there is nothing to relink.
+    mark_verified used to do it from /api/verify; it is deleted rather than kept as an alias precisely
     because a caller that sets verified without relinking recreates the
     duplicate-account bug this state machine exists to prevent.
 

@@ -31,7 +31,8 @@ def is_relink_complete(*, verified: bool, relink_state: str) -> bool:
       feature was enabled after a test run.
 
     Deliberately stricter than "relinked OR legacy": `verified` is required in
-    both branches. mark_relinked sets both columns in one statement so
+    both branches. mark_relinked (and verify_and_complete under skip) set both
+    columns in one statement so
     (verified = FALSE, relink_state = 'relinked') is unreachable through the
     code, but if a hand-edited row ever produced it, treating it as complete
     would ALLOW a user whose overlay still serves the synthetic address -- the
