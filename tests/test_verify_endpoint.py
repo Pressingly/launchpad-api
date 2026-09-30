@@ -145,7 +145,29 @@ async def test_skip_mode_still_refuses_an_address_another_account_verified(
     response = await client.get("/api/verify?token=skiptaken", follow_redirects=False)
 
     assert "verify_error=email_taken" in response.headers["location"]
-    assert (await db.fetch_user(sid))["verified"] is False
+    # Consuming and completing are one transaction, so the refusal (here the
+    # verified-address index firing on the completing UPDATE) rolls the whole
+    # click back: the user keeps a working link and is not left token-less in
+    # pending_relink, which nothing completes under skip.
+    user = await db.fetch_user(sid)
+    assert user["verified"] is False
+    assert user["verification_token"] is not None
+    assert await relink_state(sid) == "none"
+
+
+async def test_skip_mode_writes_the_verify_audit_row(
+    client, cleanup_test_users, admin_conn, monkeypatch
+):
+    monkeypatch.setattr(settings, "launchpad_relink_runner", RELINK_SKIP)
+    sid = f"test_{secrets.token_hex(4)}"
+    await seed_pending(sid, f"jane-{secrets.token_hex(4)}@example.com", "skipaudit")
+
+    await client.get("/api/verify?token=skipaudit", follow_redirects=False)
+
+    actions = await admin_conn.fetch(
+        "SELECT action FROM foss_users_audit WHERE synthetic_id = $1", sid
+    )
+    assert [row["action"] for row in actions] == ["verify_email"]
 
 
 async def test_skip_mode_leaves_an_expired_token_unconsumed(

@@ -32,6 +32,21 @@ TEST_ADMIN_DSN = os.environ.get(
 
 
 @pytest.fixture(autouse=True)
+def _pin_relink_mode():
+    """Tests assert the held path unless they set a mode themselves, so the
+    LAUNCHPAD_RELINK_RUNNER in a developer's .env must not leak into them.
+
+    Set and restored by hand rather than through `monkeypatch`: requesting
+    monkeypatch from an autouse fixture sets it up first and so tears it down
+    last, which leaves the Valkey-outage fixture's patches in place while the
+    rate-limiter reset runs."""
+    previous = settings.launchpad_relink_runner
+    settings.launchpad_relink_runner = ""
+    yield
+    settings.launchpad_relink_runner = previous
+
+
+@pytest.fixture(autouse=True)
 async def _reset_pool_per_test():
     """Pytest-asyncio creates a fresh event loop per test, so we must close
     and recreate the asyncpg pool for each one — otherwise the pool's

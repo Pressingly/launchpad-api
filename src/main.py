@@ -504,16 +504,23 @@ async def submit_email(
 
 @app.get("/api/verify")
 async def verify_email(token: str, request: Request):
-    # NOTE: this GET is state-mutating (consumes the one-use token). Enterprise
-    # mail scanners / link-prefetchers can therefore "click" the link before the
-    # user does. The outcome is still benign, but no longer for the reason this
-    # comment used to give: a prefetch no longer leaves them verified, it leaves
-    # them in pending_relink, i.e. HELD by the gate until a relink completes.
-    # Benign because they were going to be held anyway and the address is not
-    # live until the relink runs -- not because they "end up verified". If this
-    # endpoint ever gains side-effects beyond that, gate it behind an
-    # interstitial POST.
+    # NOTE: this GET is state-mutating (consumes the one-use token), and nothing
+    # ties the click to the session that asked for the address: the route has no
+    # auth in front. Enterprise mail scanners / link-prefetchers can therefore
+    # "click" the link before the user does.
+    #   * manual: benign. The click only moves the requester to pending_relink,
+    #     where the gate holds them until an operator relinks them.
+    #   * runner and skip: NOT benign. The address goes live for the requesting
+    #     account without anyone at that mailbox choosing it -- a runner
+    #     completes the relink automatically, and skip completes it here. An
+    #     authenticated user who submits someone else's address is bound to it
+    #     if that mailbox's scanner follows the link.
+    # The fix is to complete only when the click carries the requester's own
+    # session (the route behind mpass-auth, or an authenticated confirm POST from
+    # the portal); tracked separately, since it changes the routing contract.
     portal = f"{settings.platform_protocol}://{settings.platform_domain}/"
+    completes_now = settings.launchpad_relink_runner == RELINK_SKIP
+    consume = db.verify_and_complete if completes_now else db.mark_pending_relink
 
     try:
         # NOT mark_verified -- that function is gone. Clicking the link proves
@@ -521,7 +528,7 @@ async def verify_email(token: str, request: Request):
         # accounts onto it. Setting verified here is what made every app create
         # a second account, so the click now only moves them to pending_relink
         # and the relink sets verified.
-        sid = await db.mark_pending_relink(
+        sid = await consume(
             token_hash=db.hash_token(token),
             ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
@@ -547,8 +554,10 @@ async def verify_email(token: str, request: Request):
     # renders nothing to explain why.
     gate_evict(sid)
 
-    if settings.launchpad_relink_runner == RELINK_SKIP:
-        return await _complete_without_relink(sid, portal)
+    if completes_now:
+        # Nothing to relink, so the address is live now: ?verified=1 makes the
+        # portal re-run sign-in and the apps get it in the identity claims.
+        return RedirectResponse(url=f"{portal}?verified=1", status_code=302)
 
     # ?relinking=1, not ?verified=1. The portal treats ?verified=1 as "your
     # address is live now" and fires a full /oauth2/sign_in round-trip to remint
@@ -558,24 +567,6 @@ async def verify_email(token: str, request: Request):
     # user back on the portal a redirect later. ?relinking=1 renders the panel
     # that says what is actually happening.
     return RedirectResponse(url=f"{portal}?relinking=1", status_code=302)
-
-
-async def _complete_without_relink(sid: str, portal: str) -> RedirectResponse:
-    """RELINK_SKIP: there are no app accounts to move, so complete the user now.
-
-    mark_relinked keeps its guards (it only completes a row that proved control
-    of the address) and is where the verified-address unique index fires, so a
-    race with another account verifying the same address lands in email_taken
-    and leaves this user in pending_relink for an operator, as under `manual`.
-    ?verified=1 makes the portal re-run sign-in, so the apps get the verified
-    address in the identity claims straight away.
-    """
-    try:
-        await db.mark_relinked(sid)
-    except db.EmailAlreadyRegistered:
-        logger.info("verify: address verified by another account before completion")
-        return RedirectResponse(url=f"{portal}?verify_error=email_taken", status_code=302)
-    return RedirectResponse(url=f"{portal}?verified=1", status_code=302)
 
 
 @app.post("/api/email/resend")

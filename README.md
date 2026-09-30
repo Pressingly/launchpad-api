@@ -54,10 +54,13 @@ full contract with defaults. The ones a deployment must set:
 - `LAUNCHPAD_RELINK_RUNNER`: what happens after a user clicks the verification
   link.
   - `skip`: the user is completed at once and signed in again with the verified
-    address. For installs where nobody has app accounts under their synthetic
-    address, because the verify-gate was on from their first login. Relink any
-    older accounts with the ops override **before** turning the gate on, or they
-    are duplicated.
+    address. Only for installs where nobody holds an app account under their
+    synthetic address, because the verify-gate was on from their first login.
+    Users who used the apps before the gate must be relinked with the ops
+    override before they can verify, or every app creates a second account for
+    them. When switching an install from `manual` to `skip`, complete any users
+    still in `pending_relink` with the override first; nothing completes them
+    under `skip`. foss-server-bundle's `platform.sh` does not accept `skip` yet.
   - `manual`: the user is held until an operator relinks their app accounts and
     completes them with the ops override CLI. For installs whose users already
     hold app accounts under their synthetic address.

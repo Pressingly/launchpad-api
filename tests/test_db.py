@@ -248,8 +248,9 @@ async def test_mark_pending_relink_raises_when_another_account_owns_the_address(
 
 
 async def test_mark_relinked_sets_both_columns(cleanup_test_users):
-    """The ONLY path that sets verified, and it sets relink_state with it -- in
-    one statement, so the two cannot separate."""
+    """The only path that sets verified outside LAUNCHPAD_RELINK_RUNNER=skip,
+    and it sets relink_state with it -- in one statement, so the two cannot
+    separate."""
     sid = _sid()
     await _submit(sid, _email(), "tok-relink")
     assert await mark_pending_relink(hash_token("tok-relink"), None, None) == sid

@@ -32,9 +32,10 @@ instead. A code comment does not cover that, so the behaviour is:
     runner    enqueue (relink_state = 'pending_relink'); the runner completes it
     anything else   refuse -- exact, case-sensitive match, same as platform.sh
 
-The same three values gate `platform.sh --up` (`_validate_launchpad_switch`).
-Both sides match exactly and case-sensitively; if you change one, change the
-other and the runbook table with it.
+foss-server-bundle's `platform.sh --up` (`_validate_launchpad_switch`) gates on
+the same values except `skip`, which it does not accept yet. Both sides match
+exactly and case-sensitively; if you change one, change the other and the
+runbook table with it.
 
 Re-queueing a `relink_failed` user
 -----------------------------------
