@@ -1,0 +1,87 @@
+name: tests
+
+# The schema is built exactly the way a deployment builds it -- sql/bootstrap.sql
+# as superuser, then `python -m src.migrate` -- so the suite verifies the DDL the
+# image ships rather than a second copy of it.
+
+on:
+  pull_request:
+  push:
+    branches: [foss-main, foss-sandbox]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    # Containerised on purpose: service containers are reachable by their
+    # `services:` key only from a containerised job, and the tests address
+    # http://mailpit:8025 directly. Pinned to match the Dockerfile's base image.
+    container: python:3.11-slim
+
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg17
+        env:
+          # Fixture credentials for a throwaway container; not secrets, so the
+          # workflow also runs on forks.
+          POSTGRES_PASSWORD: pw
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mailpit:
+        image: axllent/mailpit:latest
+      valkey:
+        image: valkey/valkey:8-alpine
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_NAME: launchpad
+      DB_USER: launchpad_api_user
+      DB_PASSWORD: testpw1
+      SMTP_HOST: mailpit
+      SMTP_PORT: '1025'
+      SMTP_USE_TLS: 'false'
+      FROM_ADDRESS: noreply@askii.ai
+      FROM_NAME: FOSS Launchpad
+      PLATFORM_PROTOCOL: https
+      PLATFORM_DOMAIN: test.example.com
+      # Deliberately not askii.ai, so a regression that hardcodes the default
+      # domain instead of wiring this through stays red.
+      SYNTHETIC_EMAIL_DOMAIN: synthetic.example.com
+      REDIS_URL: redis://valkey:6379/11
+      TEST_ADMIN_DSN: postgresql://postgres:pw@postgres:5432/launchpad
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bootstrap the database and roles
+        env:
+          PGPASSWORD: pw
+          LAUNCHPAD_DB_PASSWORD: testpw1
+          LAUNCHPAD_MPASS_DB_PASSWORD: testpw2
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends postgresql-client
+          psql -h postgres -U postgres -d postgres -f sql/bootstrap.sql
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt -r requirements-test.txt
+
+      - name: Apply the schema
+        env:
+          MIGRATE_DATABASE_URL: postgresql://postgres:pw@postgres:5432/launchpad
+        run: python -m src.migrate
+
+      - name: pytest
+        run: python -m pytest

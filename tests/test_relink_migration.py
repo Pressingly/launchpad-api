@@ -1,7 +1,7 @@
-"""The `relink_state` migration from scripts/provision/launchpad.sql.
+"""The `relink_state` migration from sql/schema.sql.
 
 There is still no migration framework, so the column ships as an ALTER block
-inside the provisioning script that `./platform.sh --provision.launchpad` runs.
+inside the schema that `python -m src.migrate` applies.
 The SQL below mirrors that block, in the same order. It is duplicated rather
 than parsed out of the file -- extracting statements from a .sql script full of
 psql meta-commands and dollar-quoted blocks is brittle -- and it has drifted
@@ -14,9 +14,9 @@ This previously mirrored a hand-run block in dev/docs/launchpad-runbook.md. That
 block was replaced by the provisioning command; the runbook now points at the
 script rather than carrying its own copy of the SQL.
 
-One deliberate difference from the source: `launchpad.sql` wraps its DROP+ADD
-constraint pair in an explicit transaction, because psql autocommits and a
-validation failure would otherwise leave the table with no constraint at all.
+One deliberate difference from the source: `src.migrate` applies the whole of
+sql/schema.sql in one transaction, so a validation failure cannot leave the
+table with no constraint at all.
 These tests drive the statements individually through asyncpg, where each gets
 its own implicit transaction, so that pairing is not reproduced here. The
 pre-flight below is what makes the failure diagnosable in both.

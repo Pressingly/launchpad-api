@@ -215,7 +215,7 @@ async def test_migration_admits_the_new_audit_actions(migrated_schema):
             # The ops override's action. It is in this list because the CHECK is
             # the only thing standing between the override and a 500 on a
             # database that was migrated before FOSS-13 -- the vocabulary lives
-            # in four places (postgres/init-databases.sh, the runbook's step 4,
+            # in four places (sql/schema.sql, the runbook's step 4,
             # MIGRATION_SQL above, and here) and this is the assertion that
             # notices when one of them is missed.
             "ops_override",
