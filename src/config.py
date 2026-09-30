@@ -2,6 +2,15 @@
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
+# LAUNCHPAD_RELINK_RUNNER value for installs where no user has an app account
+# under their synthetic address when they verify: the verify-gate was on from
+# their first login, so the apps never saw them, and any older accounts were
+# relinked by an operator before the gate went on. Clicking the verification
+# link then completes the user at once instead of holding them in
+# pending_relink for a relink that has nothing to move. Wrong for any install
+# where users used the apps before the gate: their accounts would be duplicated.
+RELINK_SKIP = "skip"
+
 
 class Settings(BaseSettings):
     # Postgres
@@ -66,10 +75,11 @@ class Settings(BaseSettings):
     synthetic_email_domain: str = ""
     gate_cache_ttl_seconds: int = 10
 
-    # Which relink mechanism is deployed: "" (none), "manual" or "runner". The
-    # ops override CLI (src/ops_override.py) branches on it and refuses when it
-    # is empty -- completing a relink that has not happened is what creates the
-    # duplicate app accounts the whole state machine exists to prevent.
+    # Which relink mechanism is deployed: "" (none), "manual", "runner" or
+    # "skip". The ops override CLI (src/ops_override.py) branches on it and
+    # refuses when it is empty -- completing a relink that has not happened is
+    # what creates the duplicate app accounts the whole state machine exists to
+    # prevent. "skip" completes a user as soon as they verify (see RELINK_SKIP).
     #
     # Named for the environment variable rather than for the concept, and that
     # matters: env_prefix is "" (see Config below), so a field called

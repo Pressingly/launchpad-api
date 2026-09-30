@@ -130,6 +130,36 @@ async def test_an_unrecognised_runner_value_refuses():
 
 
 # ---------------------------------------------------------------------------
+# skip: new users complete at /api/verify; the override is for accounts that
+# predate the gate, so it behaves exactly like manual
+# ---------------------------------------------------------------------------
+
+
+async def test_skip_without_relink_done_refuses_and_prints_the_assertion():
+    sid = new_sid()
+    await seed_pending(sid, new_email("skip"), "tok-skip")
+
+    with pytest.raises(OverrideRefused) as exc:
+        await _override(sid, new_email("skip-new"), runner="skip")
+
+    assert "LAUNCHPAD_RELINK_RUNNER=skip" in str(exc.value)
+    assert "SECOND account" in str(exc.value)
+    assert (await db.fetch_user(sid))["verified"] is False
+
+
+async def test_skip_with_relink_done_completes_like_manual():
+    sid, new = new_sid(), new_email("skip-done")
+    await seed_pending(sid, new_email("skip-old"), "tok-skip-ok")
+
+    await _override(sid, new, runner="skip", relink_done=True)
+
+    user = await db.fetch_user(sid)
+    assert user["real_email"] == new
+    assert user["verified"] is True
+    assert user["relink_state"] == "relinked"
+
+
+# ---------------------------------------------------------------------------
 # Case 2 of 3 — manual: require --relink-done
 # ---------------------------------------------------------------------------
 

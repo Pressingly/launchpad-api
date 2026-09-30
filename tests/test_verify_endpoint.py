@@ -3,7 +3,8 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from src import db
-from tests.conftest import relink_state, seed_pending
+from src.config import RELINK_SKIP, settings
+from tests.conftest import relink_state, seed_pending, seed_relinked
 
 # Rows are seeded with `seed_pending`, which writes sha256(raw) into
 # verification_token directly (PRD §1.2). Going through db.insert_user would
@@ -111,3 +112,92 @@ async def test_verify_unknown_token_redirects_with_error(client):
 async def test_verify_missing_token_returns_422(client):
     response = await client.get("/api/verify")
     assert response.status_code == 422
+
+
+async def test_skip_mode_completes_the_user_and_re_signs_them_in(
+    client, cleanup_test_users, monkeypatch
+):
+    """LAUNCHPAD_RELINK_RUNNER=skip: no app accounts exist to move, so the click
+    completes the user and the portal re-runs sign-in to pick up the address."""
+    monkeypatch.setattr(settings, "launchpad_relink_runner", RELINK_SKIP)
+    sid = f"test_{secrets.token_hex(4)}"
+    await seed_pending(sid, f"jane-{secrets.token_hex(4)}@example.com", "skiptok")
+
+    response = await client.get("/api/verify?token=skiptok", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert response.headers["location"].endswith("?verified=1")
+    user = await db.fetch_user(sid)
+    assert user["verified"] is True
+    assert user["verified_at"] is not None
+    assert await relink_state(sid) == "relinked"
+
+
+async def test_skip_mode_still_refuses_an_address_another_account_verified(
+    client, cleanup_test_users, monkeypatch
+):
+    monkeypatch.setattr(settings, "launchpad_relink_runner", RELINK_SKIP)
+    email = f"taken-{secrets.token_hex(4)}@example.com"
+    await seed_relinked(f"test_{secrets.token_hex(4)}", email)
+    sid = f"test_{secrets.token_hex(4)}"
+    await seed_pending(sid, email, "skiptaken")
+
+    response = await client.get("/api/verify?token=skiptaken", follow_redirects=False)
+
+    assert "verify_error=email_taken" in response.headers["location"]
+    # Consuming and completing are one transaction, so the refusal (here the
+    # verified-address index firing on the completing UPDATE) rolls the whole
+    # click back: the user keeps a working link and is not left token-less in
+    # pending_relink, which nothing completes under skip.
+    user = await db.fetch_user(sid)
+    assert user["verified"] is False
+    assert user["verification_token"] is not None
+    assert await relink_state(sid) == "none"
+
+
+async def test_skip_mode_writes_the_verify_audit_row(
+    client, cleanup_test_users, admin_conn, monkeypatch
+):
+    monkeypatch.setattr(settings, "launchpad_relink_runner", RELINK_SKIP)
+    sid = f"test_{secrets.token_hex(4)}"
+    await seed_pending(sid, f"jane-{secrets.token_hex(4)}@example.com", "skipaudit")
+
+    await client.get("/api/verify?token=skipaudit", follow_redirects=False)
+
+    actions = await admin_conn.fetch(
+        "SELECT action FROM foss_users_audit WHERE synthetic_id = $1", sid
+    )
+    assert [row["action"] for row in actions] == ["verify_email"]
+
+
+async def test_skip_mode_leaves_an_expired_token_unconsumed(
+    client, cleanup_test_users, monkeypatch
+):
+    monkeypatch.setattr(settings, "launchpad_relink_runner", RELINK_SKIP)
+    sid = f"test_{secrets.token_hex(4)}"
+    expired = datetime.now(timezone.utc) - timedelta(hours=1)
+    await seed_pending(sid, f"jane-{secrets.token_hex(4)}@example.com", "skipold", expires=expired)
+
+    response = await client.get("/api/verify?token=skipold", follow_redirects=False)
+
+    assert "verify_error=expired_or_invalid" in response.headers["location"]
+    assert (await db.fetch_user(sid))["verified"] is False
+
+
+async def test_skip_mode_does_not_complete_a_user_an_operator_is_holding(
+    client, cleanup_test_users, admin_conn, monkeypatch
+):
+    """A user parked in pending_relink (relink not done yet) who gets a fresh
+    link through resend must not complete themselves once skip is on."""
+    monkeypatch.setattr(settings, "launchpad_relink_runner", RELINK_SKIP)
+    sid = f"test_{secrets.token_hex(4)}"
+    await seed_pending(sid, f"jane-{secrets.token_hex(4)}@example.com", "heldtok")
+    await admin_conn.execute(
+        "UPDATE foss_users SET relink_state = 'pending_relink' WHERE synthetic_id = $1", sid
+    )
+
+    response = await client.get("/api/verify?token=heldtok", follow_redirects=False)
+
+    assert "verify_error=expired_or_invalid" in response.headers["location"]
+    assert (await db.fetch_user(sid))["verified"] is False
+    assert await relink_state(sid) == "pending_relink"

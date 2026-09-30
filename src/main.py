@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from src import consent_text, db, rate_limit
 from src.gate import GateAction, decide_gate, verified_state
 from src.gate import evict as gate_evict
-from src.config import settings
+from src.config import RELINK_SKIP, settings
 from src.models import EmailSubmitRequest, UserStateResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -504,24 +504,31 @@ async def submit_email(
 
 @app.get("/api/verify")
 async def verify_email(token: str, request: Request):
-    # NOTE: this GET is state-mutating (consumes the one-use token). Enterprise
-    # mail scanners / link-prefetchers can therefore "click" the link before the
-    # user does. The outcome is still benign, but no longer for the reason this
-    # comment used to give: a prefetch no longer leaves them verified, it leaves
-    # them in pending_relink, i.e. HELD by the gate until a relink completes.
-    # Benign because they were going to be held anyway and the address is not
-    # live until the relink runs -- not because they "end up verified". If this
-    # endpoint ever gains side-effects beyond that, gate it behind an
-    # interstitial POST.
+    # NOTE: this GET is state-mutating (consumes the one-use token), and nothing
+    # ties the click to the session that asked for the address: the route has no
+    # auth in front. Enterprise mail scanners / link-prefetchers can therefore
+    # "click" the link before the user does.
+    #   * manual: benign. The click only moves the requester to pending_relink,
+    #     where the gate holds them until an operator relinks them.
+    #   * runner and skip: NOT benign. The address goes live for the requesting
+    #     account without anyone at that mailbox choosing it -- a runner
+    #     completes the relink automatically, and skip completes it here. An
+    #     authenticated user who submits someone else's address is bound to it
+    #     if that mailbox's scanner follows the link.
+    # The fix is to complete only when the click carries the requester's own
+    # session (the route behind mpass-auth, or an authenticated confirm POST from
+    # the portal); tracked separately, since it changes the routing contract.
     portal = f"{settings.platform_protocol}://{settings.platform_domain}/"
+    completes_now = settings.launchpad_relink_runner == RELINK_SKIP
+    consume = db.verify_and_complete if completes_now else db.mark_pending_relink
 
     try:
         # NOT mark_verified -- that function is gone. Clicking the link proves
         # the user controls the address; it does not move their five app
-        # accounts onto it. Setting verified here is what made every app create
-        # a second account, so the click now only moves them to pending_relink
-        # and the relink sets verified.
-        sid = await db.mark_pending_relink(
+        # accounts onto it. Under manual and runner the click therefore only
+        # moves them to pending_relink and the relink sets verified. Only under
+        # skip, where there are no accounts to move, does the click complete.
+        sid = await consume(
             token_hash=db.hash_token(token),
             ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
@@ -546,6 +553,11 @@ async def verify_email(token: str, request: Request):
     # their previous state for up to the TTL and gets bounced somewhere that
     # renders nothing to explain why.
     gate_evict(sid)
+
+    if completes_now:
+        # Nothing to relink, so the address is live now: ?verified=1 makes the
+        # portal re-run sign-in and the apps get it in the identity claims.
+        return RedirectResponse(url=f"{portal}?verified=1", status_code=302)
 
     # ?relinking=1, not ?verified=1. The portal treats ?verified=1 as "your
     # address is live now" and fires a full /oauth2/sign_in round-trip to remint
