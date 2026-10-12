@@ -59,12 +59,11 @@ class NoSubmissionYet(Exception):
 
 
 class RelinkHeld(Exception):
-    """The caller's row is held at pending_relink or relink_failed.
+    """The caller's row is held; only the operator override releases it."""
 
-    Only the operator override releases a held row. Letting the user restart
-    the flow would put them back at 'none', which skip mode completes on the
-    next click without the relink the hold is waiting for.
-    """
+    def __init__(self, relink_state: str):
+        self.relink_state = relink_state
+        super().__init__(f"relink held at {relink_state}")
 
 
 HELD_RELINK_STATES = ("pending_relink", "relink_failed")
@@ -203,15 +202,8 @@ async def submit_email(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # The ON CONFLICT branch is constrained to unverified, unheld rows,
-            # so any other caller is skipped rather than reset. Verified against
-            # PostgreSQL 17: a skipped conflict yields INSERT 0 0 and RETURNING
-            # produces zero rows, while both the insert and the update branches
-            # always return one. There is no ambiguous third case -- an insert
-            # failing for any other reason raises. So None means exactly
-            # "exists and is verified or held". The WHERE is the enforcement;
-            # the follow-up read only picks which refusal to report, and the
-            # skipped conflict has already locked the row it reads.
+            # A conflict the WHERE skips still locks the row, so the refusal
+            # read below sees the state that caused the skip.
             row = await conn.fetchrow(
                 """
                 INSERT INTO foss_users (
@@ -234,7 +226,7 @@ async def submit_email(
                 token_hash, verification_expires,
             )
             if row is None:
-                raise await _submission_refusal(conn, synthetic_id)
+                raise await _held_or_verified(conn, synthetic_id)
 
             # Is this address already verified by somebody else? Best-effort:
             # a SELECT under READ COMMITTED, so a concurrent verification can
@@ -290,13 +282,13 @@ async def submit_email(
     return _collision
 
 
-async def _submission_refusal(conn: asyncpg.Connection, synthetic_id: str) -> Exception:
+async def _held_or_verified(conn: asyncpg.Connection, synthetic_id: str) -> Exception:
     relink_state = await conn.fetchval(
         "SELECT relink_state FROM foss_users WHERE synthetic_id = $1",
         synthetic_id,
     )
     if relink_state in HELD_RELINK_STATES:
-        return RelinkHeld()
+        return RelinkHeld(relink_state)
     return AlreadyVerified()
 
 
@@ -559,7 +551,8 @@ async def rotate_verification_token(
     """Issue a fresh verification token for an unverified row.
 
     Returns {"real_email", "display_name"} on success.
-    Raises NoSubmissionYet or AlreadyVerified.
+    Raises NoSubmissionYet, RelinkHeld or AlreadyVerified, the last two in the
+    same order submit_email reports them.
 
     One statement decides eligibility and rotates. The previous shape was
     fetch -> check -> update across three separate connections, so two
@@ -582,6 +575,7 @@ async def rotate_verification_token(
                            verification_expires = $3,
                            updated_at = now()
                      WHERE synthetic_id = $1 AND verified = FALSE
+                       AND relink_state = 'none'
                     RETURNING real_email, display_name
                 )
                 SELECT (SELECT count(*) FROM target)      AS row_exists,
@@ -604,7 +598,7 @@ async def rotate_verification_token(
             # email -- because the send then failed on a None address and was
             # swallowed.
             if row["was_verified"] or row["real_email"] is None:
-                raise AlreadyVerified()
+                raise await _held_or_verified(conn, synthetic_id)
 
             await _insert_audit(
                 conn,

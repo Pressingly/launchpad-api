@@ -22,7 +22,6 @@ from tests.conftest import (
     latest_token,
     mailpit_clear,
     mailpit_messages,
-    mailpit_token,
     new_email,
     new_sid,
     relink_state,
@@ -183,12 +182,32 @@ async def test_correcting_after_clicking_the_link_is_refused(raw_client, clean_m
     assert user["verification_token"] is None
 
 
-async def _hold(sid: str, state: str) -> None:
+HELD_ERRORS = {"pending_relink": "relink_in_progress", "relink_failed": "relink_failed"}
+
+
+async def _hold(sid: str, state: str, verified: bool = False) -> None:
     pool = await db.get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE foss_users SET relink_state = $2 WHERE synthetic_id = $1", sid, state
+            "UPDATE foss_users SET relink_state = $2, verified = $3 WHERE synthetic_id = $1",
+            sid, state, verified,
         )
+
+
+async def resend(ac, sid: str):
+    return await ac.post(
+        "/api/email/resend", headers={"X-Auth-Request-Preferred-Username": sid}
+    )
+
+
+async def _assert_hold_untouched(sid: str, held_email: str, held_state: str, raw_token: str):
+    user = await db.fetch_user(sid)
+    assert user["real_email"] == held_email
+    assert user["relink_state"] == held_state
+    assert user["verified"] is False
+    assert user["verification_token"] == sha256_hex(raw_token)
+    assert await audit_actions(sid) == []
+    assert await mailpit_messages() == []
 
 
 @pytest.mark.parametrize("mode", ["manual", RELINK_SKIP])
@@ -204,31 +223,62 @@ async def test_a_held_user_cannot_resubmit_their_way_out_of_the_hold(
     response = await submit(raw_client, sid, new_email("escape"))
 
     assert response.status_code == 409
-    user = await db.fetch_user(sid)
-    assert user["real_email"] == held
-    assert user["relink_state"] == held_state
-    assert user["verified"] is False
-    assert user["verification_token"] == sha256_hex("tok-held")
-    assert await audit_actions(sid) == []
-    assert await mailpit_messages() == []
+    assert response.json()["error"] == HELD_ERRORS[held_state]
+    await _assert_hold_untouched(sid, held, held_state, "tok-held")
+
+
+@pytest.mark.parametrize("mode", ["manual", RELINK_SKIP])
+@pytest.mark.parametrize("held_state", ["pending_relink", "relink_failed"])
+async def test_a_held_user_cannot_resend_their_way_out_of_the_hold(
+    raw_client, clean_mailbox, monkeypatch, mode, held_state
+):
+    monkeypatch.setattr(settings, "launchpad_relink_runner", mode)
+    sid, held = new_sid(), new_email("held-resend")
+    await seed_pending(sid, held, "tok-held-resend")
+    await _hold(sid, held_state)
+
+    response = await resend(raw_client, sid)
+
+    assert response.status_code == 409
+    assert response.json()["error"] == HELD_ERRORS[held_state]
+    await _assert_hold_untouched(sid, held, held_state, "tok-held-resend")
+
+
+@pytest.mark.parametrize("endpoint", ["submit", "resend"])
+async def test_an_interrupted_override_reports_the_hold_not_verified(
+    raw_client, clean_mailbox, endpoint
+):
+    """(verified, pending_relink) is held to /api/me and the gate, so both
+    endpoints say held too."""
+    sid = new_sid()
+    await seed_pending(sid, new_email("interrupted"), "tok-interrupted")
+    await _hold(sid, "pending_relink", verified=True)
+
+    if endpoint == "submit":
+        response = await submit(raw_client, sid, new_email("interrupted-escape"))
+    else:
+        response = await resend(raw_client, sid)
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "relink_in_progress"
 
 
 @pytest.mark.parametrize("held_state", ["pending_relink", "relink_failed"])
 async def test_under_skip_a_held_user_cannot_complete_through_any_link(
     raw_client, clean_mailbox, monkeypatch, held_state
 ):
-    """The FOSS-510 path end to end: resubmit, then click. Neither the link
-    the user already holds nor a fresh one may complete a held row."""
+    """The FOSS-510 path end to end: resubmit or resend, then click. Neither
+    the link the user already holds nor a fresh one may complete a held row."""
     monkeypatch.setattr(settings, "launchpad_relink_runner", RELINK_SKIP)
     sid = new_sid()
     await seed_pending(sid, new_email("held-skip"), "tok-held-skip")
     await _hold(sid, held_state)
 
-    await submit(raw_client, sid, new_email("held-skip-escape"))
-    mailed = [await mailpit_token(m["ID"]) for m in await mailpit_messages()]
-    for token in ["tok-held-skip", *mailed]:
-        response = await raw_client.get(f"/api/verify?token={token}", follow_redirects=False)
-        assert "verify_error=expired_or_invalid" in response.headers["location"]
+    assert (await submit(raw_client, sid, new_email("held-skip-escape"))).status_code == 409
+    assert (await resend(raw_client, sid)).status_code == 409
+    assert await mailpit_messages() == []
+    response = await raw_client.get("/api/verify?token=tok-held-skip", follow_redirects=False)
+    assert "verify_error=expired_or_invalid" in response.headers["location"]
 
     user = await db.fetch_user(sid)
     assert user["verified"] is False

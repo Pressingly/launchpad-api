@@ -436,6 +436,26 @@ async def test_a_verified_row_still_held_reports_the_hold(cleanup_test_users):
     assert await _state(sid) == "pending_relink"
 
 
+@pytest.mark.parametrize("held_state", ["pending_relink", "relink_failed"])
+async def test_rotate_verification_token_refuses_a_held_row(cleanup_test_users, held_state):
+    sid = _sid()
+    await _submit(sid, _email(), "tok-held-rotate")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET relink_state = $2 WHERE synthetic_id = $1",
+            sid, held_state,
+        )
+
+    with pytest.raises(RelinkHeld) as exc:
+        await rotate_verification_token(sid, hash_token("tok-new"), _in_a_day(), None, None)
+
+    assert exc.value.relink_state == held_state
+    user = await fetch_user(sid)
+    assert user["verification_token"] == hash_token("tok-held-rotate")
+    assert user["relink_state"] == held_state
+
+
 async def test_rotate_verification_token_returns_the_recipient(cleanup_test_users):
     sid, email = _sid(), _email()
     await _submit(sid, email, "old_token", display_name="Jane")
