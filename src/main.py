@@ -107,7 +107,7 @@ _RELINK_HELD_REPLIES = {
 
 
 def _relink_held_response(exc: db.RelinkHeld) -> JSONResponse:
-    error, detail = _RELINK_HELD_REPLIES[exc.relink_state]
+    error, detail = _RELINK_HELD_REPLIES.get(exc.relink_state, _RELINK_HELD_REPLIES["pending_relink"])
     return JSONResponse(status_code=409, content={"error": error, "detail": detail})
 
 
