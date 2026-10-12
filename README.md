@@ -149,11 +149,16 @@ docker exec -it launchpad-api python -m src.ops_override --help
 
 ## Releases
 
-The intended pipeline follows the other FOSS services: tags trigger Cloud Build,
-`vX.Y.Z-rc.N` publishes to the sandbox Artifact Registry, and `vX.Y.Z` publishes
-to production after approval. The image path is
-`<registry>/foss-launchpad-api/launchpad-api`. The triggers for this repository
-are being set up by DevOps and are not live yet.
+Tags trigger Cloud Build, as for the other FOSS services. Push the `release/<tag>`
+branch at the release commit first, then the annotated tag:
+
+- `vX.Y.Z-rc.N` on `foss-sandbox` publishes to the sandbox Artifact Registry
+  (`foss-launchpad-api-sbx-trigger`). Staging pins the image by its short commit SHA.
+- `vX.Y.Z` on `foss-main` publishes to the production Artifact Registry once DevOps
+  approves the build.
+
+The image path is `<registry>/foss-launchpad-api/launchpad-api`. Deployments pin
+`launchpad-migrate` and `launchpad-api` to the same image, so move both pins together.
 
 ## License
 
