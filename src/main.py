@@ -443,6 +443,14 @@ async def submit_email(
             ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
         )
+    except db.RelinkHeld:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Your email address is being set up. "
+                "Contact your administrator to change it."
+            ),
+        )
     except db.AlreadyVerified:
         # The caller's own state, which /api/me already returns to them, so this
         # discloses nothing. Refusing rather than accepting matters: the old

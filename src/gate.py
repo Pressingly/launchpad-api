@@ -65,7 +65,7 @@ def decide_gate(
     administrator" is a message for /api/me and the portal to draw from
     relink_state; the gate only needs to know the user is not through yet, and
     both states agree on that."""
-    if relink_state in ("pending_relink", "relink_failed"):
+    if relink_state in db.HELD_RELINK_STATES:
         return GateAction.RELINKING
     if not is_relink_complete(verified=verified, relink_state=relink_state):
         return GateAction.COLLECT

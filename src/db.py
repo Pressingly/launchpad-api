@@ -58,6 +58,18 @@ class NoSubmissionYet(Exception):
     """The caller has no foss_users row to act on."""
 
 
+class RelinkHeld(Exception):
+    """The caller's row is held at pending_relink or relink_failed.
+
+    Only the operator override releases a held row. Letting the user restart
+    the flow would put them back at 'none', which skip mode completes on the
+    next click without the relink the hold is waiting for.
+    """
+
+
+HELD_RELINK_STATES = ("pending_relink", "relink_failed")
+
+
 class AuditVocabularyMissing(Exception):
     """foss_users_audit's CHECK does not accept 'ops_override' yet.
 
@@ -177,31 +189,29 @@ async def submit_email(
     holding a personal email address with no record that the user agreed to it
     -- the exact inverse of what this feature exists to produce.
 
-    Raises AlreadyVerified when the caller's row is already verified.
+    Raises RelinkHeld when the caller's row is held (pending_relink or
+    relink_failed), whatever `verified` says, and AlreadyVerified when it is
+    otherwise already verified. Both refusals write nothing.
 
-    A pending_relink caller IS accepted, and the upsert resets relink_state to
-    'none'. That is deliberate -- the relink target just changed, so a marker
-    saying one is in flight to the old address would be false. The UI offers no
-    resubmit control in that state, so this is the API being more permissive
-    than the portal rather than a route users are pointed at.
-
-    It does leave a gap for part 2: under LAUNCHPAD_RELINK_RUNNER=manual an
-    operator may already have moved some app accounts to the old address when
-    the user resubmits, and nothing records that. The manual path needs a
-    reconciliation step; the runner path does not, because it reads
-    relink_state and will simply not find them queued.
+    A held row is refused rather than reset to 'none'. Under
+    LAUNCHPAD_RELINK_RUNNER=skip, /api/verify completes any row at 'none', so a
+    reset let a held user complete themselves with a fresh link and skip the
+    manual merge the hold exists for; under manual, an operator may already
+    have moved app accounts onto the held address. Only the operator override
+    releases a held row.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # The ON CONFLICT branch is constrained to unverified rows, so a
-            # verified caller is skipped rather than reset. Verified against
+            # The ON CONFLICT branch is constrained to unverified, unheld rows,
+            # so any other caller is skipped rather than reset. Verified against
             # PostgreSQL 17: a skipped conflict yields INSERT 0 0 and RETURNING
             # produces zero rows, while both the insert and the update branches
             # always return one. There is no ambiguous third case -- an insert
             # failing for any other reason raises. So None means exactly
-            # "exists and is already verified", with no second query and no
-            # read-then-write race.
+            # "exists and is verified or held". The WHERE is the enforcement;
+            # the follow-up read only picks which refusal to report, and the
+            # skipped conflict has already locked the row it reads.
             row = await conn.fetchrow(
                 """
                 INSERT INTO foss_users (
@@ -215,23 +225,16 @@ async def submit_email(
                     verification_token = EXCLUDED.verification_token,
                     verification_expires = EXCLUDED.verification_expires,
                     verified = FALSE,
-                    -- A fresh submission starts the flow over, so it must not
-                    -- leave the row in pending_relink: that state means "this
-                    -- address is being relinked", and the address has just
-                    -- changed. Only unverified rows reach this branch, so a
-                    -- relinked user is never reset -- verified = FALSE with
-                    -- relink_state = 'pending_relink' is the only combination
-                    -- this can overwrite.
-                    relink_state = 'none',
                     updated_at = now()
                 WHERE foss_users.verified = FALSE
+                  AND foss_users.relink_state = 'none'
                 RETURNING synthetic_id
                 """,
                 synthetic_id, email, display_name,
                 token_hash, verification_expires,
             )
             if row is None:
-                raise AlreadyVerified()
+                raise await _submission_refusal(conn, synthetic_id)
 
             # Is this address already verified by somebody else? Best-effort:
             # a SELECT under READ COMMITTED, so a concurrent verification can
@@ -276,23 +279,25 @@ async def submit_email(
             _collision = bool(collision)
 
     # Outside the transaction, so the memo is never dropped for a write that
-    # then rolls back. The ON CONFLICT above resets relink_state from
-    # 'pending_relink' to 'none', and the memo carries relink_state as well as
-    # the address -- so a user who corrects their address while held at
-    # RELINKING would keep being held for up to the TTL instead of being sent
-    # back to COLLECT.
-    #
-    # That direction is fail-closed (held, not released) and /api/me reads the
-    # database directly, so the portal panel is already correct. Evicting anyway
-    # because gate.evict's contract is unconditional: every transition that
-    # changes a memoized field evicts. The next transition added may not be
-    # fail-closed, and the invariant is only useful if it has no exceptions.
+    # then rolls back. The memo carries the address, and a correction changes
+    # it; gate.evict's contract is unconditional: every transition that changes
+    # a memoized field evicts.
     #
     # Imported locally, like the other two evict sites: src.gate imports src.db,
     # so a module-level import here is circular.
     from src import gate as _gate
     _gate.evict(synthetic_id)
     return _collision
+
+
+async def _submission_refusal(conn: asyncpg.Connection, synthetic_id: str) -> Exception:
+    relink_state = await conn.fetchval(
+        "SELECT relink_state FROM foss_users WHERE synthetic_id = $1",
+        synthetic_id,
+    )
+    if relink_state in HELD_RELINK_STATES:
+        return RelinkHeld()
+    return AlreadyVerified()
 
 
 _CONSUME_TOKEN_HOLD = """

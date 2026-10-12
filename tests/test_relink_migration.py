@@ -41,13 +41,13 @@ BEGIN
           INTO bad
           FROM foss_users
          WHERE relink_state IS NULL
-            OR relink_state NOT IN ('none', 'pending_relink', 'relinked');
+            OR relink_state NOT IN ('none', 'pending_relink', 'relink_failed', 'relinked');
 
         IF bad IS NOT NULL THEN
             RAISE EXCEPTION
                 'Cannot apply the relink_state constraint: existing rows hold '
                 'values outside the vocabulary: %. Decide what each row should '
-                'be (none | pending_relink | relinked), UPDATE them, then '
+                'be (none | pending_relink | relink_failed | relinked), UPDATE them, then '
                 're-run this migration.', bad;
         END IF;
     END IF;
@@ -64,10 +64,10 @@ MIGRATION_SQL = [
     # 3. The vocabulary, named and dropped first so a re-run replaces it.
     "ALTER TABLE foss_users DROP CONSTRAINT IF EXISTS foss_users_relink_state_check",
     "ALTER TABLE foss_users ADD CONSTRAINT foss_users_relink_state_check "
-    "CHECK (relink_state IN ('none', 'pending_relink', 'relinked'))",
+    "CHECK (relink_state IN ('none', 'pending_relink', 'relink_failed', 'relinked'))",
     # 4. The column comment, so `\d+ foss_users` explains the legacy case.
     "COMMENT ON COLUMN foss_users.relink_state IS "
-    "'How far the app-account relink has got: none | pending_relink | relinked. "
+    "'How far the app-account relink has got: none | pending_relink | relink_failed | relinked. "
     "verified = TRUE with relink_state = ''none'' is the legacy combination "
     "(verified before this column existed) and is treated as complete.'",
 ]
@@ -109,7 +109,7 @@ async def unmigrated_schema(admin_conn, cleanup_test_users):
         await admin_conn.execute(
             "ALTER TABLE foss_users ADD COLUMN relink_state TEXT NOT NULL "
             "DEFAULT 'none' CONSTRAINT foss_users_relink_state_check "
-            "CHECK (relink_state IN ('none', 'pending_relink', 'relinked'))"
+            "CHECK (relink_state IN ('none', 'pending_relink', 'relink_failed', 'relinked'))"
         )
 
 
