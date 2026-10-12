@@ -16,7 +16,7 @@ here.
 import pytest
 
 from src import db
-from src.config import settings
+from src.config import RELINK_SKIP, settings
 from tests.conftest import (
     audit_actions,
     latest_token,
@@ -27,6 +27,7 @@ from tests.conftest import (
     relink_state,
     seed_pending,
     seed_relinked,
+    sha256_hex,
     submit,
 )
 
@@ -162,36 +163,126 @@ async def test_the_audit_trail_shows_both_submissions(raw_client, clean_mailbox)
     assert all(r["consent_text_version"] for r in rows)
 
 
-async def test_correcting_after_clicking_the_link_returns_to_pending_verification(
-    raw_client, clean_mailbox
-):
-    """A user in pending_relink who resubmits is reset to a fresh verification.
-
-    This is PRD-G's behaviour, asserted here rather than added: submit_email's
-    ON CONFLICT branch sets `relink_state = 'none'` because a fresh submission
-    starts the flow over and the address it was relinking has just changed.
-    Leaving it in pending_relink would queue a relink onto an address the user
-    abandoned.
-
-    Note the portal deliberately offers no control that reaches this state --
-    the relinking panel has no resubmit button, by design (PRD-G) -- so this is
-    the API's behaviour for a caller that gets here some other way, not a flow
-    the UI invites.
-    """
-    sid = new_sid()
-    await submit(raw_client, sid, new_email("clicked"))
+async def test_correcting_after_clicking_the_link_is_refused(raw_client, clean_mailbox):
+    """Clicking the link holds the user at pending_relink, and only the operator
+    override releases them. The portal offers no resubmit control there; this
+    is the API refusing a caller who POSTs anyway."""
+    sid, clicked = new_sid(), new_email("clicked")
+    await submit(raw_client, sid, clicked)
     token = await latest_token()
     await raw_client.get(f"/api/verify?token={token}", follow_redirects=False)
     assert (await db.fetch_user(sid))["relink_state"] == "pending_relink"
 
-    corrected = new_email("clicked-fix")
-    assert (await submit(raw_client, sid, corrected)).status_code == 202
+    assert (await submit(raw_client, sid, new_email("clicked-fix"))).status_code == 409
 
     user = await db.fetch_user(sid)
-    assert user["real_email"] == corrected
-    assert user["relink_state"] == "none"
+    assert user["real_email"] == clicked
+    assert user["relink_state"] == "pending_relink"
     assert user["verified"] is False
-    assert user["verification_token"] is not None
+    assert user["verification_token"] is None
+
+
+HELD_ERRORS = {"pending_relink": "relink_in_progress", "relink_failed": "relink_failed"}
+
+
+async def _hold(sid: str, state: str, verified: bool = False) -> None:
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE foss_users SET relink_state = $2, verified = $3 WHERE synthetic_id = $1",
+            sid, state, verified,
+        )
+
+
+async def resend(ac, sid: str):
+    return await ac.post(
+        "/api/email/resend", headers={"X-Auth-Request-Preferred-Username": sid}
+    )
+
+
+async def _assert_hold_untouched(sid: str, held_email: str, held_state: str, raw_token: str):
+    user = await db.fetch_user(sid)
+    assert user["real_email"] == held_email
+    assert user["relink_state"] == held_state
+    assert user["verified"] is False
+    assert user["verification_token"] == sha256_hex(raw_token)
+    assert await audit_actions(sid) == []
+    assert await mailpit_messages() == []
+
+
+@pytest.mark.parametrize("mode", ["manual", RELINK_SKIP])
+@pytest.mark.parametrize("held_state", ["pending_relink", "relink_failed"])
+async def test_a_held_user_cannot_resubmit_their_way_out_of_the_hold(
+    raw_client, clean_mailbox, monkeypatch, mode, held_state
+):
+    monkeypatch.setattr(settings, "launchpad_relink_runner", mode)
+    sid, held = new_sid(), new_email("held")
+    await seed_pending(sid, held, "tok-held")
+    await _hold(sid, held_state)
+
+    response = await submit(raw_client, sid, new_email("escape"))
+
+    assert response.status_code == 409
+    assert response.json()["error"] == HELD_ERRORS[held_state]
+    await _assert_hold_untouched(sid, held, held_state, "tok-held")
+
+
+@pytest.mark.parametrize("mode", ["manual", RELINK_SKIP])
+@pytest.mark.parametrize("held_state", ["pending_relink", "relink_failed"])
+async def test_a_held_user_cannot_resend_their_way_out_of_the_hold(
+    raw_client, clean_mailbox, monkeypatch, mode, held_state
+):
+    monkeypatch.setattr(settings, "launchpad_relink_runner", mode)
+    sid, held = new_sid(), new_email("held-resend")
+    await seed_pending(sid, held, "tok-held-resend")
+    await _hold(sid, held_state)
+
+    response = await resend(raw_client, sid)
+
+    assert response.status_code == 409
+    assert response.json()["error"] == HELD_ERRORS[held_state]
+    await _assert_hold_untouched(sid, held, held_state, "tok-held-resend")
+
+
+@pytest.mark.parametrize("endpoint", ["submit", "resend"])
+async def test_an_interrupted_override_reports_the_hold_not_verified(
+    raw_client, clean_mailbox, endpoint
+):
+    """(verified, pending_relink) is held to /api/me and the gate, so both
+    endpoints say held too."""
+    sid = new_sid()
+    await seed_pending(sid, new_email("interrupted"), "tok-interrupted")
+    await _hold(sid, "pending_relink", verified=True)
+
+    if endpoint == "submit":
+        response = await submit(raw_client, sid, new_email("interrupted-escape"))
+    else:
+        response = await resend(raw_client, sid)
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "relink_in_progress"
+
+
+@pytest.mark.parametrize("held_state", ["pending_relink", "relink_failed"])
+async def test_under_skip_a_held_user_cannot_complete_through_any_link(
+    raw_client, clean_mailbox, monkeypatch, held_state
+):
+    """The FOSS-510 path end to end: resubmit or resend, then click. Neither
+    the link the user already holds nor a fresh one may complete a held row."""
+    monkeypatch.setattr(settings, "launchpad_relink_runner", RELINK_SKIP)
+    sid = new_sid()
+    await seed_pending(sid, new_email("held-skip"), "tok-held-skip")
+    await _hold(sid, held_state)
+
+    assert (await submit(raw_client, sid, new_email("held-skip-escape"))).status_code == 409
+    assert (await resend(raw_client, sid)).status_code == 409
+    assert await mailpit_messages() == []
+    response = await raw_client.get("/api/verify?token=tok-held-skip", follow_redirects=False)
+    assert "verify_error=expired_or_invalid" in response.headers["location"]
+
+    user = await db.fetch_user(sid)
+    assert user["verified"] is False
+    assert user["relink_state"] == held_state
 
 
 async def test_a_verified_user_cannot_change_their_own_address(raw_client):
@@ -224,39 +315,19 @@ async def test_a_correction_sends_to_the_new_address_only(raw_client, clean_mail
     assert recipients == [right]
 
 
-async def test_correcting_from_pending_relink_evicts_the_gate_memo(raw_client):
+async def test_correcting_the_address_evicts_the_gate_memo(raw_client):
     """gate.evict's contract is unconditional: every transition that changes a
-    memoized field evicts. submit_email is such a transition -- its ON CONFLICT
-    resets relink_state from 'pending_relink' to 'none' -- and it did not.
-
-    The user-visible effect is a stale HOLD, not a leak: the gate keeps
-    returning RELINKING instead of COLLECT for up to GATE_CACHE_TTL_SECONDS
-    after the user corrects their address. Fail-closed, and /api/me reads the
-    database directly so the portal panel is already right. Asserted anyway
-    because the invariant is only worth having if it has no exceptions, and the
-    next transition added may not be fail-closed.
-    """
+    memoized field evicts, and the memo carries the address."""
     from src import gate
 
     sid, first = new_sid(), new_email("evict-pending")
     await seed_pending(sid, first, "tok-evict-pending")
+    _, email, _ = await gate.verified_state(sid, ttl_seconds=300)
+    assert email == first, "memo must be primed for the test to mean anything"
 
-    # Move to pending_relink and prime the memo by reading through the gate.
-    pool = await db.get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE foss_users SET relink_state = 'pending_relink' WHERE synthetic_id = $1",
-            sid,
-        )
-    _, _, state = await gate.verified_state(sid, ttl_seconds=300)
-    assert state == "pending_relink", "memo must be primed for the test to mean anything"
-
-    # Correct the address. The row goes back to 'none'.
-    response = await submit(raw_client, sid, new_email("evict-corrected"))
+    corrected = new_email("evict-corrected")
+    response = await submit(raw_client, sid, corrected)
     assert response.status_code == 202
-    assert await relink_state(sid) == "none"
 
-    # Same generous TTL: without the evict this still answers 'pending_relink'
-    # from the memo, and the gate holds a user who should be at COLLECT.
-    _, _, after = await gate.verified_state(sid, ttl_seconds=300)
-    assert after == "none"
+    _, after, _ = await gate.verified_state(sid, ttl_seconds=300)
+    assert after == corrected

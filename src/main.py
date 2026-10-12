@@ -92,6 +92,25 @@ def extract_synthetic_id(x_auth_request_preferred_username: str) -> str:
     return x_auth_request_preferred_username
 
 
+_RELINK_HELD_REPLIES = {
+    "pending_relink": (
+        "relink_in_progress",
+        "Your email address is being set up. "
+        "Contact your administrator to change it.",
+    ),
+    "relink_failed": (
+        "relink_failed",
+        "Setting up your email address needs an administrator. "
+        "Contact your administrator to change it.",
+    ),
+}
+
+
+def _relink_held_response(exc: db.RelinkHeld) -> JSONResponse:
+    error, detail = _RELINK_HELD_REPLIES.get(exc.relink_state, _RELINK_HELD_REPLIES["pending_relink"])
+    return JSONResponse(status_code=409, content={"error": error, "detail": detail})
+
+
 async def _handle_rate_limited(
     exc: rate_limit.RateLimitExceeded,
     synthetic_id: str,
@@ -443,6 +462,8 @@ async def submit_email(
             ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
         )
+    except db.RelinkHeld as exc:
+        return _relink_held_response(exc)
     except db.AlreadyVerified:
         # The caller's own state, which /api/me already returns to them, so this
         # discloses nothing. Refusing rather than accepting matters: the old
@@ -599,6 +620,8 @@ async def resend_verification(request: Request, x_auth_request_preferred_usernam
         )
     except db.NoSubmissionYet:
         raise HTTPException(status_code=400, detail="No email submitted yet")
+    except db.RelinkHeld as exc:
+        return _relink_held_response(exc)
     except db.AlreadyVerified:
         # 409 rather than the 400 this returned previously, matching /api/email
         # for the same user state. One state, one status code.
