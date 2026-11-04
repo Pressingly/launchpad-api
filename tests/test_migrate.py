@@ -23,6 +23,8 @@ SNAPSHOT_QUERIES = (
     f"""SELECT table_name, column_name, data_type, is_nullable, column_default
          FROM information_schema.columns WHERE table_name LIKE ANY ({SCHEMA_TABLES})
         ORDER BY 1, 2""",
+    """SELECT tgrelid::regclass::text, tgname, pg_get_triggerdef(oid) FROM pg_trigger
+        WHERE NOT tgisinternal ORDER BY 1, 2""",
     """SELECT grantee, table_name, privilege_type FROM information_schema.role_table_grants
         WHERE grantee IN ('launchpad_api_user', 'mpass_auth_user') ORDER BY 1, 2, 3""",
     """SELECT grantee, table_name, column_name, privilege_type

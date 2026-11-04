@@ -8,6 +8,9 @@ import secrets
 import asyncpg
 import pytest
 
+from src import migrate
+from tests.conftest import TEST_ADMIN_DSN
+
 MPASS_BINDING_SQL = (
     "INSERT INTO buzz_identities (sub, pubkey_hex, email) VALUES ($1, $2, $3) "
     "ON CONFLICT (sub) DO NOTHING"
@@ -60,8 +63,11 @@ async def columns_with(conn: asyncpg.Connection, role: str, privilege: str) -> s
 
 
 class TestGrants:
-    async def test_mpass_role_can_bind_and_read_but_not_delete(self, admin_conn):
-        assert await table_privileges(admin_conn, "mpass_auth_user") == {"SELECT", "INSERT"}
+    async def test_mpass_role_reads_but_holds_no_table_wide_write(self, admin_conn):
+        assert await table_privileges(admin_conn, "mpass_auth_user") == {"SELECT"}
+
+    async def test_mpass_role_may_insert_only_the_binding_columns(self, admin_conn):
+        assert await columns_with(admin_conn, "mpass_auth_user", "INSERT") == {"sub", "pubkey_hex", "email"}
 
     async def test_mpass_role_may_update_only_revoked_at(self, admin_conn):
         assert await columns_with(admin_conn, "mpass_auth_user", "UPDATE") == {"revoked_at"}
@@ -118,6 +124,19 @@ class TestMpassRoleAtRuntime:
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await rolled_back.execute(statement, sub)
 
+    @pytest.mark.parametrize("column, value", [
+        ("revoked_at", "now()"),
+        ("created_at", "'2020-01-01'::timestamptz"),
+    ])
+    async def test_cannot_insert_pre_revoked_or_backdated_rows(self, rolled_back, column, value):
+        await as_role(rolled_back, "mpass_auth_user")
+
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await rolled_back.execute(
+                f"INSERT INTO buzz_identities (sub, pubkey_hex, {column}) VALUES ($1, $2, {value})",
+                new_sub(), new_pubkey(),
+            )
+
     async def test_api_role_cannot_write(self, rolled_back):
         await as_role(rolled_back, "launchpad_api_user")
 
@@ -164,3 +183,46 @@ class TestConstraints:
         assert row["email"] is None
         assert row["created_at"] is not None
         assert row["revoked_at"] is None
+
+
+async def revoked_identity(conn: asyncpg.Connection) -> str:
+    sub = new_sub()
+    await conn.execute(MPASS_BINDING_SQL, sub, new_pubkey(), None)
+    await conn.execute("UPDATE buzz_identities SET revoked_at = now() WHERE sub = $1", sub)
+    return sub
+
+
+class TestRevocationIsFinal:
+    @pytest.mark.parametrize("role", ["mpass_auth_user", None])
+    @pytest.mark.parametrize("new_value", ["NULL", "now() + interval '1 day'"])
+    async def test_set_revoked_at_cannot_be_cleared_or_changed(self, rolled_back, role, new_value):
+        if role:
+            await as_role(rolled_back, role)
+        sub = await revoked_identity(rolled_back)
+
+        with pytest.raises(asyncpg.RaiseError, match="revocation of .* is final"):
+            await rolled_back.execute(f"UPDATE buzz_identities SET revoked_at = {new_value} WHERE sub = $1", sub)
+
+    async def test_revoking_twice_with_the_same_value_is_a_no_op(self, rolled_back):
+        await as_role(rolled_back, "mpass_auth_user")
+        sub = await revoked_identity(rolled_back)
+
+        await rolled_back.execute("UPDATE buzz_identities SET revoked_at = revoked_at WHERE sub = $1", sub)
+
+    async def test_other_columns_of_a_revoked_row_stay_editable_by_the_owner(self, rolled_back):
+        sub = await revoked_identity(rolled_back)
+
+        await rolled_back.execute("UPDATE buzz_identities SET email = 'ops@example.com' WHERE sub = $1", sub)
+
+    async def test_reapplying_the_schema_keeps_exactly_one_trigger(self, admin_conn):
+        schema = migrate.SCHEMA_PATH.read_text()
+        await migrate.apply_schema(TEST_ADMIN_DSN, schema)
+        await migrate.apply_schema(TEST_ADMIN_DSN, schema)
+
+        triggers = await admin_conn.fetch(
+            """
+            SELECT tgname FROM pg_trigger
+             WHERE tgrelid = 'buzz_identities'::regclass AND NOT tgisinternal
+            """
+        )
+        assert [row["tgname"] for row in triggers] == ["buzz_identities_revocation_is_final"]
