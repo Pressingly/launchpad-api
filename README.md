@@ -75,8 +75,8 @@ Two steps, in this order, on every deploy. Both are idempotent.
 1. **Bootstrap (superuser, owned by the deployment).** Creates the `launchpad`
    database and the LOGIN roles `launchpad_api_user` (read+write) and
    `mpass_auth_user` (for mpass-auth-proxy: read-only on three columns of
-   `foss_users`; it binds Buzz keys in `buzz_identities`, and revocation lands
-   with mpass-auth-proxy's revoke path), and
+   `foss_users`; it binds Buzz keys in `buzz_identities` and enrolls, re-grants
+   and revokes Buzz agent keys in `buzz_agents`), and
    resets both passwords. It refuses empty passwords, because Postgres accepts
    `PASSWORD ''` silently and that would take every login down.
 

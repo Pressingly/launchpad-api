@@ -12,11 +12,15 @@
 --
 -- Two roles connect:
 --   launchpad_api_user   read+write on the email-capture tables and read-only
---                        on buzz_identities, used by launchpad-api
+--                        on buzz_identities and buzz_agents, used by
+--                        launchpad-api
 --   mpass_auth_user      used by mpass-auth-proxy: read-only on three columns
 --                        of foss_users (never verification_token); on
 --                        buzz_identities it binds keys, and may only ever set
---                        revoked_at once. See the GRANTs at the bottom.
+--                        revoked_at once; on buzz_agents it enrolls agent keys,
+--                        replaces their grants and revokes them, never
+--                        re-enrolling a revoked one. See the GRANTs at the
+--                        bottom.
 -- =============================================================================
 
 -- Serialize concurrent runs (several pods starting at once). Without this, two
@@ -249,6 +253,79 @@ END
 $do$;
 
 -- -----------------------------------------------------------------------------
+-- buzz_agents: agent keys enrolled through NIP-FA agent grants. Each agent key
+-- is generated on its owner's desktop and belongs to one owner (a
+-- buzz_identities row) for good. Only the SHA-256 of the current opaque grant
+-- is stored, so a database dump holds no usable grant.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS buzz_agents (
+    agent_pubkey      TEXT        PRIMARY KEY
+        CONSTRAINT buzz_agents_agent_pubkey_check CHECK (agent_pubkey ~ '^[0-9a-f]{64}$'),
+    owner_sub         TEXT        NOT NULL
+        CONSTRAINT buzz_agents_owner_sub_fkey REFERENCES buzz_identities(sub),
+    enrolled_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    grant_hash        TEXT        UNIQUE
+        CONSTRAINT buzz_agents_grant_hash_check CHECK (grant_hash ~ '^[0-9a-f]{64}$'),
+    grant_expires_at  TIMESTAMPTZ,
+    revoked_at        TIMESTAMPTZ,
+    CONSTRAINT buzz_agents_grant_has_expiry_check
+        CHECK ((grant_hash IS NULL) = (grant_expires_at IS NULL)),
+    CONSTRAINT buzz_agents_revoked_holds_no_grant_check
+        CHECK (revoked_at IS NULL OR grant_hash IS NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_buzz_agents_owner_sub
+    ON buzz_agents(owner_sub);
+
+COMMENT ON COLUMN buzz_agents.agent_pubkey IS
+    'BIP-340 x-only public key of the agent as 64 lowercase hex characters.';
+
+COMMENT ON COLUMN buzz_agents.owner_sub IS
+    'The owner''s mPass ID (buzz_identities.sub). Fixed at enrollment: an agent key belongs to one owner for good (see buzz_agents_owner_and_revocation_are_final).';
+
+COMMENT ON COLUMN buzz_agents.grant_hash IS
+    'Lowercase hex SHA-256 of the current opaque agent grant. Set together with grant_expires_at and NULL once revoked (both enforced by CHECKs). A new enrollment replaces it, which invalidates every earlier grant for the agent.';
+
+COMMENT ON COLUMN buzz_agents.revoked_at IS
+    'Set when the owner revokes the agent. One-way, and a revoked agent can never be enrolled again: once set, revoked_at cannot change and grant_hash cannot be set. Rows are never deleted.';
+
+-- The same finality as buzz_identities, for every role including the table
+-- owner, so a leaked mpass_auth_user credential can neither move an agent to
+-- another owner nor bring a revoked agent back with a fresh grant.
+CREATE OR REPLACE FUNCTION buzz_agents_keep_owner_and_revocation() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.owner_sub IS DISTINCT FROM OLD.owner_sub THEN
+        RAISE EXCEPTION 'buzz_agents: agent % belongs to its owner for good; owner_sub cannot change', OLD.agent_pubkey;
+    END IF;
+    IF OLD.revoked_at IS NOT NULL AND NEW.revoked_at IS DISTINCT FROM OLD.revoked_at THEN
+        RAISE EXCEPTION 'buzz_agents: revocation of % is final; revoked_at cannot be cleared or changed', OLD.agent_pubkey;
+    END IF;
+    IF NEW.revoked_at IS NOT NULL AND NEW.grant_hash IS NOT NULL
+       AND NEW.grant_hash IS DISTINCT FROM OLD.grant_hash THEN
+        RAISE EXCEPTION 'buzz_agents: agent % is revoked and cannot be enrolled again', OLD.agent_pubkey;
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+-- Created only when missing, for the same lock reason as
+-- buzz_identities_revocation_is_final.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT FROM pg_trigger
+         WHERE tgrelid = 'buzz_agents'::regclass
+           AND tgname = 'buzz_agents_owner_and_revocation_are_final'
+    ) THEN
+        CREATE TRIGGER buzz_agents_owner_and_revocation_are_final
+            BEFORE UPDATE ON buzz_agents
+            FOR EACH ROW EXECUTE FUNCTION buzz_agents_keep_owner_and_revocation();
+    END IF;
+END
+$do$;
+
+-- -----------------------------------------------------------------------------
 -- Grants. No UPDATE or DELETE on the audit table: it is the consent record this
 -- feature exists to produce, and a leaked launchpad_api_user credential must not
 -- be able to erase it. mpass_auth_user gets a column-level SELECT because its
@@ -264,6 +341,12 @@ $do$;
 -- another key. launchpad-api does not manage Buzz identities and only reads
 -- them. The REVOKE first makes the grant set exact on every run, column
 -- privileges included.
+--
+-- On buzz_agents mpass_auth_user enrolls agents (INSERT names no enrolled_at or
+-- revoked_at, so it cannot backdate or pre-revoke a row), replaces their grant
+-- and revokes them. No UPDATE of owner_sub or agent_pubkey and no DELETE; the
+-- trigger above keeps revocation final and refuses re-enrolling a revoked
+-- agent. launchpad-api only reads agents.
 -- -----------------------------------------------------------------------------
 GRANT USAGE ON SCHEMA public TO launchpad_api_user, mpass_auth_user;
 
@@ -278,3 +361,11 @@ GRANT SELECT                         ON buzz_identities   TO launchpad_api_user;
 GRANT SELECT                         ON buzz_identities   TO mpass_auth_user;
 GRANT INSERT (sub, pubkey_hex, email) ON buzz_identities  TO mpass_auth_user;
 GRANT UPDATE (revoked_at)            ON buzz_identities   TO mpass_auth_user;
+
+REVOKE ALL ON buzz_agents FROM launchpad_api_user, mpass_auth_user;
+GRANT SELECT                         ON buzz_agents       TO launchpad_api_user;
+GRANT SELECT                         ON buzz_agents       TO mpass_auth_user;
+GRANT INSERT (agent_pubkey, owner_sub, grant_hash, grant_expires_at)
+                                     ON buzz_agents       TO mpass_auth_user;
+GRANT UPDATE (grant_hash, grant_expires_at, revoked_at)
+                                     ON buzz_agents       TO mpass_auth_user;

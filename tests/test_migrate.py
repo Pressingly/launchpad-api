@@ -12,7 +12,7 @@ import asyncpg
 from src import migrate
 from tests.conftest import TEST_ADMIN_DSN
 
-SCHEMA_TABLES = "ARRAY['foss_users%', 'buzz_identities']"
+SCHEMA_TABLES = "ARRAY['foss_users%', 'buzz_identities', 'buzz_agents']"
 
 SNAPSHOT_QUERIES = (
     f"""SELECT conrelid::regclass::text, conname, pg_get_constraintdef(oid)
