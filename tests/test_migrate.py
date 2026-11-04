@@ -12,15 +12,19 @@ import asyncpg
 from src import migrate
 from tests.conftest import TEST_ADMIN_DSN
 
+SCHEMA_TABLES = "ARRAY['foss_users%', 'buzz_identities']"
+
 SNAPSHOT_QUERIES = (
-    """SELECT conrelid::regclass::text, conname, pg_get_constraintdef(oid)
-         FROM pg_constraint WHERE conrelid::regclass::text LIKE 'foss_users%'
+    f"""SELECT conrelid::regclass::text, conname, pg_get_constraintdef(oid)
+         FROM pg_constraint WHERE conrelid::regclass::text LIKE ANY ({SCHEMA_TABLES})
         ORDER BY 1, 2""",
-    """SELECT indexname, indexdef FROM pg_indexes
-        WHERE tablename LIKE 'foss_users%' ORDER BY 1""",
-    """SELECT table_name, column_name, data_type, is_nullable, column_default
-         FROM information_schema.columns WHERE table_name LIKE 'foss_users%'
+    f"""SELECT indexname, indexdef FROM pg_indexes
+        WHERE tablename LIKE ANY ({SCHEMA_TABLES}) ORDER BY 1""",
+    f"""SELECT table_name, column_name, data_type, is_nullable, column_default
+         FROM information_schema.columns WHERE table_name LIKE ANY ({SCHEMA_TABLES})
         ORDER BY 1, 2""",
+    """SELECT tgrelid::regclass::text, tgname, pg_get_triggerdef(oid) FROM pg_trigger
+        WHERE NOT tgisinternal ORDER BY 1, 2""",
     """SELECT grantee, table_name, privilege_type FROM information_schema.role_table_grants
         WHERE grantee IN ('launchpad_api_user', 'mpass_auth_user') ORDER BY 1, 2, 3""",
     """SELECT grantee, table_name, column_name, privilege_type
