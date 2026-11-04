@@ -226,3 +226,15 @@ class TestRevocationIsFinal:
             """
         )
         assert [row["tgname"] for row in triggers] == ["buzz_identities_revocation_is_final"]
+
+    async def test_reapplying_the_schema_leaves_the_trigger_in_place(self, admin_conn):
+        trigger_oid_sql = """
+            SELECT oid FROM pg_trigger
+             WHERE tgrelid = 'buzz_identities'::regclass
+               AND tgname = 'buzz_identities_revocation_is_final'
+        """
+        before = await admin_conn.fetchval(trigger_oid_sql)
+
+        await migrate.apply_schema(TEST_ADMIN_DSN, migrate.SCHEMA_PATH.read_text())
+
+        assert await admin_conn.fetchval(trigger_oid_sql) == before

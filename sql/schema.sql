@@ -230,10 +230,23 @@ BEGIN
 END
 $$;
 
-DROP TRIGGER IF EXISTS buzz_identities_revocation_is_final ON buzz_identities;
-CREATE TRIGGER buzz_identities_revocation_is_final
-    BEFORE UPDATE ON buzz_identities
-    FOR EACH ROW EXECUTE FUNCTION buzz_identities_keep_revocation();
+-- Created only when missing: DROP + CREATE on every run would take an
+-- AccessExclusive lock on buzz_identities each deploy, stalling key issuance and
+-- failing the migration behind any open transaction on the table. The function
+-- body above still updates in place through CREATE OR REPLACE.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT FROM pg_trigger
+         WHERE tgrelid = 'buzz_identities'::regclass
+           AND tgname = 'buzz_identities_revocation_is_final'
+    ) THEN
+        CREATE TRIGGER buzz_identities_revocation_is_final
+            BEFORE UPDATE ON buzz_identities
+            FOR EACH ROW EXECUTE FUNCTION buzz_identities_keep_revocation();
+    END IF;
+END
+$do$;
 
 -- -----------------------------------------------------------------------------
 -- Grants. No UPDATE or DELETE on the audit table: it is the consent record this
