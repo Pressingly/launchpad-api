@@ -11,10 +11,12 @@
 -- `mpass_auth_user` with non-empty passwords. See the README.
 --
 -- Two roles connect:
---   launchpad_api_user   read+write, used by launchpad-api
---   mpass_auth_user      read-only on three columns of foss_users, used by
---                        mpass-auth-proxy. It deliberately cannot read
---                        verification_token; see the GRANT at the bottom.
+--   launchpad_api_user   read+write on the email-capture tables and read-only
+--                        on buzz_identities, used by launchpad-api
+--   mpass_auth_user      used by mpass-auth-proxy: read-only on three columns
+--                        of foss_users (never verification_token), and
+--                        insert-only plus revoked_at on buzz_identities. See
+--                        the GRANTs at the bottom.
 -- =============================================================================
 
 -- Serialize concurrent runs (several pods starting at once). Without this, two
@@ -190,12 +192,41 @@ CREATE INDEX IF NOT EXISTS idx_foss_users_audit_ts
     ON foss_users_audit(ts);
 
 -- -----------------------------------------------------------------------------
+-- buzz_identities: the Nostr public key mpass-auth-proxy derived for each mPass
+-- ID, so a Buzz key stays bound to one person. Only the public half is stored;
+-- the secret is re-derived on demand and never persisted. No FK to foss_users:
+-- with email capture off a Buzz user has no foss_users row.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS buzz_identities (
+    sub         TEXT        PRIMARY KEY,
+    pubkey_hex  TEXT        NOT NULL UNIQUE
+        CONSTRAINT buzz_identities_pubkey_hex_check CHECK (pubkey_hex ~ '^[0-9a-f]{64}$'),
+    email       TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at  TIMESTAMPTZ
+);
+
+COMMENT ON COLUMN buzz_identities.sub IS
+    'The mPass ID (Cognito cognito:username, the same value as foss_users.synthetic_id), never the Cognito sub.';
+
+COMMENT ON COLUMN buzz_identities.pubkey_hex IS
+    'BIP-340 x-only public key as 64 lowercase hex characters. Unique so one Nostr key can never be bound to two people.';
+
+COMMENT ON COLUMN buzz_identities.revoked_at IS
+    'Set when the identity is revoked; mpass-auth-proxy then refuses to issue its key. Rows are never deleted, so a revoked key cannot be re-bound.';
+
+-- -----------------------------------------------------------------------------
 -- Grants. No UPDATE or DELETE on the audit table: it is the consent record this
 -- feature exists to produce, and a leaked launchpad_api_user credential must not
 -- be able to erase it. mpass_auth_user gets a column-level SELECT because its
 -- only query is
 --   SELECT real_email FROM foss_users WHERE synthetic_id = $1 AND verified = TRUE
 -- so it can never read verification tokens, hashed or otherwise.
+--
+-- On buzz_identities mpass_auth_user may bind a key and revoke it, nothing
+-- more: no DELETE and no UPDATE of pubkey_hex, so a leaked credential cannot
+-- move a person onto another key or erase a revocation. launchpad-api does not
+-- manage Buzz identities and only reads them.
 -- -----------------------------------------------------------------------------
 GRANT USAGE ON SCHEMA public TO launchpad_api_user, mpass_auth_user;
 
@@ -204,3 +235,7 @@ GRANT SELECT, INSERT                 ON foss_users_audit  TO launchpad_api_user;
 GRANT USAGE ON SEQUENCE foss_users_audit_id_seq           TO launchpad_api_user;
 
 GRANT SELECT (synthetic_id, real_email, verified) ON foss_users TO mpass_auth_user;
+
+GRANT SELECT                         ON buzz_identities   TO launchpad_api_user;
+GRANT SELECT, INSERT                 ON buzz_identities   TO mpass_auth_user;
+GRANT UPDATE (revoked_at)            ON buzz_identities   TO mpass_auth_user;
