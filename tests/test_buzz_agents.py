@@ -323,8 +323,9 @@ class TestGrantCompleteness:
 PROXY_LOCK_OWNER_SQL = "SELECT pubkey_hex, revoked_at FROM buzz_identities WHERE sub = $1 FOR NO KEY UPDATE"
 PROXY_IS_IDENTITY_KEY_SQL = "SELECT EXISTS (SELECT 1 FROM buzz_identities WHERE pubkey_hex = $1)"
 PROXY_EXISTING_AGENT_SQL = "SELECT owner_sub, revoked_at FROM buzz_agents WHERE agent_pubkey = $1"
-PROXY_OTHER_ACTIVE_AGENTS_SQL = (
-    "SELECT count(*) FROM buzz_agents WHERE owner_sub = $1 AND revoked_at IS NULL AND agent_pubkey <> $2"
+PROXY_OTHER_LIVE_AGENTS_SQL = (
+    "SELECT count(*) FROM buzz_agents "
+    "WHERE owner_sub = $1 AND revoked_at IS NULL AND agent_pubkey <> $2 AND grant_expires_at > $3"
 )
 PROXY_ENROLL_SQL = (
     "INSERT INTO buzz_agents (agent_pubkey, owner_sub, grant_hash, grant_expires_at) "
@@ -374,8 +375,25 @@ class TestProxyStatements:
         assert await rolled_back.fetchval(PROXY_IS_IDENTITY_KEY_SQL, owner_pubkey) is True
         assert await rolled_back.fetchval(PROXY_IS_IDENTITY_KEY_SQL, agent) is False
         assert (await rolled_back.fetchrow(PROXY_EXISTING_AGENT_SQL, agent))["owner_sub"] == owner
-        assert await rolled_back.fetchval(PROXY_OTHER_ACTIVE_AGENTS_SQL, owner, agent) == 0
-        assert await rolled_back.fetchval(PROXY_OTHER_ACTIVE_AGENTS_SQL, owner, new_pubkey()) == 1
+        now = datetime.now(UTC)
+        assert await rolled_back.fetchval(PROXY_OTHER_LIVE_AGENTS_SQL, owner, agent, now) == 0
+        assert await rolled_back.fetchval(PROXY_OTHER_LIVE_AGENTS_SQL, owner, new_pubkey(), now) == 1
+
+    async def test_expired_and_revoked_agents_hold_no_slot(self, rolled_back):
+        owner = await new_owner(rolled_back)
+        await as_role(rolled_back, "mpass_auth_user")
+        live, expired, revoked = new_pubkey(), new_pubkey(), new_pubkey()
+        for agent in (live, expired, revoked):
+            await proxy_enroll(rolled_back, agent, owner, new_grant_hash())
+        await rolled_back.fetchval(PROXY_REVOKE_SQL, revoked, owner)
+        later = in_eight_days() - timedelta(hours=1)
+        await rolled_back.execute(
+            "UPDATE buzz_agents SET grant_expires_at = $2 WHERE agent_pubkey = $1", expired, later - timedelta(days=1)
+        )
+
+        assert await rolled_back.fetchval(PROXY_OTHER_LIVE_AGENTS_SQL, owner, new_pubkey(), later) == 1
+        assert await rolled_back.fetchval(PROXY_OTHER_LIVE_AGENTS_SQL, owner, live, later) == 0
+        assert await rolled_back.fetchval(PROXY_OTHER_LIVE_AGENTS_SQL, owner, expired, later) == 1
 
     async def test_enrolls_then_replaces_the_grant(self, rolled_back):
         owner = await new_owner(rolled_back)
