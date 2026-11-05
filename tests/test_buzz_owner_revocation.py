@@ -22,7 +22,7 @@ from tests.test_buzz_identities import (
 )
 
 PROXY_REVOKE_IDENTITY_SQL = (
-    "UPDATE buzz_identities SET revoked_at = now() WHERE sub = $1 AND revoked_at IS NULL "
+    "UPDATE buzz_identities SET revoked_at = clock_timestamp() WHERE sub = $1 AND revoked_at IS NULL "
     "RETURNING pubkey_hex, revoked_at"
 )
 PROXY_IDENTITY_SQL = "SELECT pubkey_hex, revoked_at FROM buzz_identities WHERE sub = $1"
