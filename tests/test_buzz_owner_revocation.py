@@ -46,15 +46,25 @@ async def recent_pubkeys(conn: asyncpg.Connection) -> set[str]:
 
 
 class TestOwnerRevocation:
-    async def test_revokes_once_and_keeps_the_first_time(self, rolled_back):
+    async def test_revokes_an_active_identity(self, rolled_back):
         owner = await new_owner(rolled_back)
         await as_role(rolled_back, "mpass_auth_user")
 
-        first = await rolled_back.fetchrow(PROXY_REVOKE_IDENTITY_SQL, owner)
+        revoked = await rolled_back.fetchrow(PROXY_REVOKE_IDENTITY_SQL, owner)
 
-        assert first["pubkey_hex"] == await owner_pubkey(rolled_back, owner)
+        assert revoked["pubkey_hex"] == await owner_pubkey(rolled_back, owner)
+        assert (await rolled_back.fetchrow(PROXY_IDENTITY_SQL, owner))["revoked_at"] == revoked["revoked_at"]
+
+    async def test_a_repeat_keeps_the_first_revocation_time(self, rolled_back):
+        owner = await new_owner(rolled_back)
+        first = await rolled_back.fetchval(
+            "UPDATE buzz_identities SET revoked_at = now() - interval '1 hour' WHERE sub = $1 RETURNING revoked_at",
+            owner,
+        )
+        await as_role(rolled_back, "mpass_auth_user")
+
         assert await rolled_back.fetchrow(PROXY_REVOKE_IDENTITY_SQL, owner) is None
-        assert (await rolled_back.fetchrow(PROXY_IDENTITY_SQL, owner))["revoked_at"] == first["revoked_at"]
+        assert (await rolled_back.fetchrow(PROXY_IDENTITY_SQL, owner))["revoked_at"] == first
 
     async def test_an_unbound_subject_has_nothing_to_revoke(self, rolled_back):
         await as_role(rolled_back, "mpass_auth_user")
@@ -64,12 +74,14 @@ class TestOwnerRevocation:
     async def test_ends_every_grant_the_owner_authorized(self, rolled_back):
         owner = await new_owner(rolled_back)
         await as_role(rolled_back, "mpass_auth_user")
-        grant_hash = new_grant_hash()
-        await proxy_enroll(rolled_back, new_pubkey(), owner, grant_hash)
+        grant_hashes = [new_grant_hash(), new_grant_hash()]
+        for grant_hash in grant_hashes:
+            await proxy_enroll(rolled_back, new_pubkey(), owner, grant_hash)
 
         await rolled_back.fetchrow(PROXY_REVOKE_IDENTITY_SQL, owner)
 
-        assert (await rolled_back.fetchrow(PROXY_GRANT_SQL, grant_hash))["owner_revoked_at"] is not None
+        for grant_hash in grant_hashes:
+            assert (await rolled_back.fetchrow(PROXY_GRANT_SQL, grant_hash))["owner_revoked_at"] is not None
         assert (await rolled_back.fetchrow(PROXY_LOCK_OWNER_SQL, owner))["revoked_at"] is not None
 
 
@@ -90,11 +102,20 @@ class TestRecentRevocations:
         assert await owner_pubkey(rolled_back, agent_owner) not in pubkeys
 
     async def test_skips_revocations_older_than_the_window(self, rolled_back):
-        owner = await new_owner(rolled_back)
+        owner, agent_owner = await new_owner(rolled_back), await new_owner(rolled_back)
+        agent = new_pubkey()
+        await proxy_enroll(rolled_back, agent, agent_owner, new_grant_hash())
+        too_old = timedelta(seconds=DENY_WINDOW_SECONDS + 1)
         await rolled_back.execute(
-            "UPDATE buzz_identities SET revoked_at = now() - $2::interval WHERE sub = $1",
-            owner, timedelta(seconds=DENY_WINDOW_SECONDS + 1),
+            "UPDATE buzz_identities SET revoked_at = now() - $2::interval WHERE sub = $1", owner, too_old
+        )
+        await rolled_back.execute(
+            "UPDATE buzz_agents SET revoked_at = now() - $2::interval, grant_hash = NULL, grant_expires_at = NULL "
+            "WHERE agent_pubkey = $1",
+            agent, too_old,
         )
         await as_role(rolled_back, "mpass_auth_user")
 
-        assert await owner_pubkey(rolled_back, owner) not in await recent_pubkeys(rolled_back)
+        recent = await recent_pubkeys(rolled_back)
+        assert await owner_pubkey(rolled_back, owner) not in recent
+        assert agent not in recent
