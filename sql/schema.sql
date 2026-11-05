@@ -337,10 +337,10 @@ $do$;
 --
 -- On buzz_identities mpass_auth_user binds keys: INSERT names only sub,
 -- pubkey_hex and email, so it cannot insert a pre-revoked row or backdate
--- created_at. Its UPDATE (revoked_at) is for the owner revoke path that lands
--- later in mpass-auth-proxy, and it is also what lets agent enrollment lock the
--- owner row with FOR NO KEY UPDATE, so it must stay; the trigger above keeps
--- that update one-way. No DELETE
+-- created_at. Its UPDATE (revoked_at) is mpass-auth-proxy's owner revocation
+-- (tests/test_buzz_owner_revocation.py), and it is also what lets agent
+-- enrollment lock the owner row with FOR NO KEY UPDATE, so it must stay; the
+-- trigger above keeps that update one-way. No DELETE
 -- and no UPDATE of pubkey_hex, so a leaked credential cannot move a person onto
 -- another key. launchpad-api does not manage Buzz identities and only reads
 -- them. The REVOKE first makes the grant set exact on every run, column
