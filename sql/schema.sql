@@ -270,8 +270,8 @@ CREATE TABLE IF NOT EXISTS buzz_agents (
     revoked_at        TIMESTAMPTZ,
     CONSTRAINT buzz_agents_grant_has_expiry_check
         CHECK ((grant_hash IS NULL) = (grant_expires_at IS NULL)),
-    CONSTRAINT buzz_agents_revoked_holds_no_grant_check
-        CHECK (revoked_at IS NULL OR grant_hash IS NULL)
+    CONSTRAINT buzz_agents_grant_while_active_check
+        CHECK ((revoked_at IS NULL) = (grant_hash IS NOT NULL))
 );
 
 CREATE INDEX IF NOT EXISTS idx_buzz_agents_owner_sub
@@ -284,14 +284,16 @@ COMMENT ON COLUMN buzz_agents.owner_sub IS
     'The owner''s mPass ID (buzz_identities.sub). Fixed at enrollment: an agent key belongs to one owner for good (see buzz_agents_owner_and_revocation_are_final).';
 
 COMMENT ON COLUMN buzz_agents.grant_hash IS
-    'Lowercase hex SHA-256 of the current opaque agent grant. Set together with grant_expires_at and NULL once revoked (both enforced by CHECKs). A new enrollment replaces it, which invalidates every earlier grant for the agent.';
+    'Lowercase hex SHA-256 of the current opaque agent grant. Set together with grant_expires_at, present exactly while the agent is not revoked (both enforced by CHECKs). A new enrollment replaces it, which invalidates every earlier grant for the agent.';
 
 COMMENT ON COLUMN buzz_agents.revoked_at IS
-    'Set when the owner revokes the agent. One-way, and a revoked agent can never be enrolled again: once set, revoked_at cannot change and grant_hash cannot be set. Rows are never deleted.';
+    'Set when the owner revokes the agent. One-way, and a revoked agent can never be enrolled again: once set, revoked_at cannot change and grant_hash cannot be set. No role this schema creates may delete rows.';
 
--- The same finality as buzz_identities, for every role including the table
--- owner, so a leaked mpass_auth_user credential can neither move an agent to
--- another owner nor bring a revoked agent back with a fresh grant.
+-- The same finality as buzz_identities on UPDATE, for every role including the
+-- table owner: owner_sub never changes and revoked_at never changes once set,
+-- so a leaked mpass_auth_user credential can neither move an agent to another
+-- owner nor bring a revoked agent back with a fresh grant. Renaming agent_pubkey
+-- or deleting a row is left to privileges: mpass_auth_user has neither.
 CREATE OR REPLACE FUNCTION buzz_agents_keep_owner_and_revocation() RETURNS trigger
     LANGUAGE plpgsql AS $$
 BEGIN
@@ -301,7 +303,7 @@ BEGIN
     IF OLD.revoked_at IS NOT NULL AND NEW.revoked_at IS DISTINCT FROM OLD.revoked_at THEN
         RAISE EXCEPTION 'buzz_agents: revocation of % is final; revoked_at cannot be cleared or changed', OLD.agent_pubkey;
     END IF;
-    IF NEW.revoked_at IS NOT NULL AND NEW.grant_hash IS NOT NULL
+    IF OLD.revoked_at IS NOT NULL AND NEW.grant_hash IS NOT NULL
        AND NEW.grant_hash IS DISTINCT FROM OLD.grant_hash THEN
         RAISE EXCEPTION 'buzz_agents: agent % is revoked and cannot be enrolled again', OLD.agent_pubkey;
     END IF;
@@ -335,8 +337,10 @@ $do$;
 --
 -- On buzz_identities mpass_auth_user binds keys: INSERT names only sub,
 -- pubkey_hex and email, so it cannot insert a pre-revoked row or backdate
--- created_at. Its UPDATE (revoked_at) is for the revoke path that lands later
--- in mpass-auth-proxy; the trigger above keeps that update one-way. No DELETE
+-- created_at. Its UPDATE (revoked_at) is for the owner revoke path that lands
+-- later in mpass-auth-proxy, and it is also what lets agent enrollment lock the
+-- owner row with FOR NO KEY UPDATE, so it must stay; the trigger above keeps
+-- that update one-way. No DELETE
 -- and no UPDATE of pubkey_hex, so a leaked credential cannot move a person onto
 -- another key. launchpad-api does not manage Buzz identities and only reads
 -- them. The REVOKE first makes the grant set exact on every run, column

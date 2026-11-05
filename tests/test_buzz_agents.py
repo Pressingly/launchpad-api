@@ -250,7 +250,7 @@ class TestOwnerAndRevocationAreFinal:
     async def test_revoking_with_a_new_grant_in_one_statement_is_refused(self, rolled_back):
         agent = await enrolled_agent(rolled_back)
 
-        with pytest.raises(asyncpg.RaiseError, match="cannot be enrolled again"):
+        with pytest.raises(asyncpg.CheckViolationError, match="buzz_agents_grant_while_active_check"):
             await rolled_back.execute(
                 "UPDATE buzz_agents SET revoked_at = now(), grant_hash = $2 WHERE agent_pubkey = $1",
                 agent, new_grant_hash(),
@@ -303,9 +303,18 @@ class TestGrantCompleteness:
     async def test_revoking_must_drop_the_grant(self, rolled_back):
         agent = await enrolled_agent(rolled_back)
 
-        with pytest.raises(asyncpg.CheckViolationError, match="buzz_agents_revoked_holds_no_grant_check"):
+        with pytest.raises(asyncpg.CheckViolationError, match="buzz_agents_grant_while_active_check"):
             await rolled_back.execute(
                 "UPDATE buzz_agents SET revoked_at = now() WHERE agent_pubkey = $1", agent
+            )
+
+    async def test_an_active_agent_must_hold_a_grant(self, rolled_back):
+        agent = await enrolled_agent(rolled_back)
+
+        with pytest.raises(asyncpg.CheckViolationError, match="buzz_agents_grant_while_active_check"):
+            await rolled_back.execute(
+                "UPDATE buzz_agents SET grant_hash = NULL, grant_expires_at = NULL WHERE agent_pubkey = $1",
+                agent,
             )
 
 
